@@ -1,0 +1,260 @@
+/* * INTERPLANETARY ROBOT - TANK MODE & LED LOGIC v4.0
+ * * Hardware Map:
+ * 1. MD25 Motor Driver (I2C) -> Pins A4 (SDA) & A5 (SCL)
+ * 2. HC-SR04 Ultrasonic -> Trig: Pin 3, Echo: Pin 2
+ * 3. Stepper Motor -> Dir: 4, Step: 5, Enable: 6
+ * 4. LED Indicator -> Pin 12
+ * * Behavior:
+ * - Default: Drives Forward (Patrol).
+ * - If Boundary Hit: Performs TANK TURN (spins in place) to new direction.
+ * - If Object <= 20cm: LED ON -> STOP -> GRAB -> LED OFF.
+ */
+
+#include <Wire.h> 
+
+// ==========================================
+// 1. PIN DEFINITIONS
+// ==========================================
+#define ledPin 12       // LED Indicator
+#define dirPin 4 
+#define stepPin 5 
+#define enablePin 6 
+#define echoPin 2 
+#define trigPin 3 
+#define stepsPerRevolution 200 
+
+// MD25 Driver Addresses
+#define MD25ADDRESS 0x58    
+// IN MODE 0 (Tank Steering):
+#define SPEED1 (byte)0x00   // Motor 1 Speed Register
+#define SPEED2 (byte)0x01   // Motor 2 Speed Register
+#define ENCODERONE 0x02     
+#define RESETENCODERS 0x10  
+#define MODESELECTOR 0xF    
+
+// ==========================================
+// 2. SETTINGS & VARIABLES
+// ==========================================
+
+// SPEED SETTINGS (128 = Stop)
+const byte DRIVE_SPEED = 145;   // Forward Speed
+const byte REV_SPEED = 110;     // Reverse Speed (for turning)
+
+// CALIBRATION (Adjust these based on real tests)
+float mm_per_click = 0.9;       
+float clicks_per_degree = 5.5;  
+
+// ODOMETRY (Start Position)
+float posX = 200.0;     
+float posY = 200.0;     
+float heading = 0.0;    // 0 = East
+const float MAX_X = 2500.0; 
+const float MAX_Y = 1200.0;
+const float MIN_X = 100.0;
+const float MIN_Y = 100.0;
+
+// SENSORS
+long duration; 
+int distance; 
+
+// ==========================================
+// 3. SETUP
+// ==========================================
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  delay(100);
+
+  // Init Pins
+  pinMode(ledPin, OUTPUT);      
+  digitalWrite(ledPin, LOW);    
+  
+  pinMode(stepPin, OUTPUT); 
+  pinMode(dirPin, OUTPUT); 
+  pinMode(enablePin, OUTPUT); 
+  digitalWrite(enablePin, LOW); 
+  
+  pinMode(trigPin, OUTPUT); 
+  pinMode(echoPin, INPUT); 
+
+  // --- SET MD25 TO MODE 0 (TANK STEERING) ---
+  Wire.beginTransmission(MD25ADDRESS); 
+  Wire.write(MODESELECTOR);
+  Wire.write(0); // Mode 0: Independent Motor Control
+  Wire.endTransmission();
+
+  encoderReset();  
+  
+  Serial.println("--- WAITING 2 SECONDS ---");
+  delay(2000); 
+  Serial.println("--- MISSION START ---");
+}
+
+// ==========================================
+// 4. MAIN LOOP
+// ==========================================
+void loop() {
+  
+  readDistance();
+
+  // ----------------------------------------
+  // CONDITION 1: OBJECT DETECTED (<= 20cm)
+  // ----------------------------------------
+  if (distance <= 20 && distance > 0) {
+    Serial.println("OBJECT FOUND (<20cm)");
+    
+    // 1. LED ON
+    digitalWrite(ledPin, HIGH); 
+    
+    // 2. Stop & Grab
+    stopMotors();                
+    delay(500);                  
+    runStepperPattern();         
+    
+    // 3. Reset
+    digitalWrite(ledPin, LOW);   
+    Serial.println("GRAB COMPLETE. SEARCHING...");
+    
+    // Optional: Back up slightly or turn to avoid re-detecting same object
+    // drive_tank_turn(45); 
+  }
+  
+  // ----------------------------------------
+  // CONDITION 2: NO OBJECT (> 20cm)
+  // ----------------------------------------
+  else {
+    digitalWrite(ledPin, LOW); // Ensure LED is OFF
+    
+    // Update where we are
+    updateOdometry();
+    
+    // Check Boundaries
+    if (checkBoundaries() == true) {
+      // HIT WALL -> TANK ROTATE to new direction
+      Serial.println("WALL DETECTED - ROTATING");
+      stopMotors();
+      drive_tank_turn(135); // Spin ~135 degrees
+    } 
+    else {
+      // PATH CLEAR -> DRIVE FORWARD
+      setTankSpeed(DRIVE_SPEED, DRIVE_SPEED); 
+    }
+  }
+  
+  delay(50); 
+}
+
+// ==========================================
+// 5. TANK STEERING FUNCTIONS (MODE 0)
+// ==========================================
+
+// Helper to set independent speeds
+void setTankSpeed(byte speedLeft, byte speedRight) {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED1);
+  Wire.write(speedLeft); 
+  Wire.write(speedRight);  
+  Wire.endTransmission();
+}
+
+void stopMotors() {
+  setTankSpeed(128, 128); 
+  delay(100);
+}
+
+// TANK TURN: Left Fwd, Right Rev (Spin in place)
+void drive_tank_turn(float angle_deg) {
+  encoderReset();
+  long targetClicks = angle_deg * clicks_per_degree;
+  
+  Serial.print("Tank Turning: "); Serial.println(angle_deg);
+  
+  // Spin: Left Forward (145), Right Reverse (110)
+  setTankSpeed(DRIVE_SPEED, REV_SPEED); 
+  
+  // Wait for turn to finish
+  while(abs(encoder1()) < targetClicks);
+  
+  stopMotors();
+  
+  // Update Heading Logic
+  heading += angle_deg;
+  if(heading >= 360) heading -= 360;
+}
+
+// ==========================================
+// 6. ODOMETRY & BOUNDARIES
+// ==========================================
+
+void updateOdometry() {
+  // Look-ahead prediction
+  float predictedX = posX + (5.0 * cos(radians(heading))); 
+  float predictedY = posY + (5.0 * sin(radians(heading)));
+  posX = predictedX;
+  posY = predictedY;
+}
+
+bool checkBoundaries() {
+  if (posX > MAX_X || posX < MIN_X || posY > MAX_Y || posY < MIN_Y) {
+    return true; // Wall hit
+  }
+  return false; // Safe
+}
+
+// ==========================================
+// 7. STEPPER & SENSOR UTILS
+// ==========================================
+
+void runStepperPattern() {
+  Serial.println("--- ARM MOVING ---");
+  
+  // Grab (Clockwise)
+  digitalWrite(dirPin, HIGH); 
+  for (int i = 0; i < stepsPerRevolution * 2; i++) { 
+    digitalWrite(stepPin, HIGH); 
+    delayMicroseconds(2000); 
+    digitalWrite(stepPin, LOW); 
+    delayMicroseconds(2000); 
+  } 
+  
+  delay(500); 
+
+  // Release/Retract (Counter-Clockwise)
+  digitalWrite(dirPin, LOW); 
+  for (int i = 0; i < stepsPerRevolution * 2; i++) { 
+    digitalWrite(stepPin, HIGH); 
+    delayMicroseconds(2000); 
+    digitalWrite(stepPin, LOW); 
+    delayMicroseconds(2000); 
+  } 
+}
+
+void readDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  duration = pulseIn(echoPin, HIGH);
+  distance = duration * 0.034 / 2; 
+}
+
+// --- MD25 UTILS ---
+void encoderReset() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(RESETENCODERS);
+  Wire.endTransmission();
+}
+
+long encoder1() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(ENCODERONE);
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  while(Wire.available() < 4);
+  long poss1 = Wire.read();
+  poss1 <<= 8; poss1 += Wire.read();
+  poss1 <<= 8; poss1 += Wire.read();
+  poss1 <<= 8; poss1 += Wire.read();
+  return(poss1);
+}
