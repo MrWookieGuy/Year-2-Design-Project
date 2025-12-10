@@ -1,0 +1,166 @@
+/* * AUTONOMOUS SEARCH ROBOT & STEPPER SAFE MODE
+ * * Hardware:
+ * 1. MD25 Motor Driver (I2C Address 0x58)
+ * 2. HC-SR04 Ultrasonic Sensor (Trig: 3, Echo: 2)
+ * 3. Stepper Motor (Dir: 4, Step: 5, Enable: 6) - IDLE
+ * 4. Status LED (Pin 12)
+ */
+
+#include <Wire.h> 
+
+// ==========================================
+// 1. PIN DEFINITIONS
+// ==========================================
+// Stepper (Kept to ensure safe state)
+#define dirPin 4 
+#define stepPin 5 
+#define enablePin 6 
+
+// LED Indicator
+#define ledPin 12
+
+// Ultrasonic Sensor
+#define echoPin 2 
+#define trigPin 3 
+
+// ==========================================
+// 2. MD25 DEFINITIONS
+// ==========================================
+#define MD25ADDRESS 0x58      
+#define SPEED1 (byte)0x00     // Left Motor Speed Register
+#define SPEED2 0x01           // Right Motor Speed Register
+#define MODESELECTOR 0xF      // Mode Register
+#define RESETENCODERS 0x10    
+
+// ==========================================
+// 3. VARIABLES
+// ==========================================
+long duration; 
+int distance; 
+
+// Speed Settings (0-255, where 128 is STOP)
+// We use a small offset (20) so the robot is not too fast.
+const int STOP_SPEED = 128;
+const int FWD_SPEED = 128 + 20;  // Forward Slow
+const int REV_SPEED = 128 - 20;  // Reverse Slow
+
+// ==========================================
+// SETUP
+// ==========================================
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  delay(100);
+
+  // --- Init LED ---
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
+
+  // --- Init Stepper Pins (Safety) ---
+  // We set Enable LOW to ensure the board doesn't float, 
+  // but we won't step the motor in the loop.
+  pinMode(stepPin, OUTPUT); 
+  pinMode(dirPin, OUTPUT); 
+  pinMode(enablePin, OUTPUT); 
+  digitalWrite(enablePin, LOW); // Enable must be low to activate driver [cite: 29]
+
+  // --- Init Ultrasonic Pins ---
+  pinMode(trigPin, OUTPUT); 
+  pinMode(echoPin, INPUT); 
+
+  // --- Init MD25 Driver to MODE 0 (Tank Steering) ---
+  // Mode 0: SPEED1 controls Motor 1, SPEED2 controls Motor 2 (unsigned)
+  Wire.beginTransmission(MD25ADDRESS); 
+  Wire.write(MODESELECTOR);
+  Wire.write(0); // Mode 0 = Skid Steer / Tank [cite: 122]
+  Wire.endTransmission();
+
+  resetEncoders(); 
+  delay(1000); // 2 Second delay required by brief usually, currently 1s
+}
+
+// ==========================================
+// MAIN LOOP
+// ==========================================
+void loop() {
+  
+  // 1. Read the Sensor
+  readDistance();
+
+  // 2. Logic: Search or Avoid
+  if (distance > 0 && distance < 30) {
+    // --- OBJECT FOUND (< 30cm) ---
+    
+    // Turn LED ON
+    digitalWrite(ledPin, HIGH);
+    Serial.println("Object Detected! Stopping.");
+
+    // Stop Motors
+    setMotors(STOP_SPEED, STOP_SPEED);
+    delay(1000); // Wait to show we found it
+
+    // Tank Turn to avoid hitting the sample/wall
+    // Left motor reverse, Right motor forward
+    Serial.println("Turning...");
+    setMotors(REV_SPEED, FWD_SPEED); 
+    delay(1500); // Turn for 1.5 seconds
+
+  } else {
+    // --- PATH CLEAR (> 30cm) ---
+    
+    // Turn LED OFF
+    digitalWrite(ledPin, LOW);
+    
+    // Drive Forward using Tank Steering
+    // Both motors set to forward speed
+    setMotors(FWD_SPEED, FWD_SPEED);
+  }
+
+  // Small delay for stability
+  delay(100);
+}
+
+// ==========================================
+// HELPER FUNCTIONS
+// ==========================================
+
+void readDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  duration = pulseIn(echoPin, HIGH);
+  distance = duration * 0.034 / 2; 
+  
+  // Filter out zero readings (sometimes happens if out of range)
+  if (distance == 0) distance = 999; 
+
+  Serial.print("Dist: ");
+  Serial.print(distance);
+  Serial.println(" cm");
+}
+
+// Helper to set both motor speeds easily
+void setMotors(int speedLeft, int speedRight) {
+   // Constrain speeds for safety
+   speedLeft = constrain(speedLeft, 0, 255);
+   speedRight = constrain(speedRight, 0, 255);
+
+   Wire.beginTransmission(MD25ADDRESS);
+   Wire.write(SPEED1);
+   Wire.write(speedLeft); 
+   Wire.endTransmission();
+   
+   Wire.beginTransmission(MD25ADDRESS);
+   Wire.write(SPEED2);
+   Wire.write(speedRight); 
+   Wire.endTransmission();
+}
+
+void resetEncoders() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(RESETENCODERS);
+  Wire.endTransmission();
+}
