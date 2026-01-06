@@ -1,0 +1,237 @@
+/* * AUTONOMOUS 3-CAN HUNTER (SINGLE SENSOR)
+ * * Hardware:
+ * 1. MD25 Motor Driver (I2C Address 0x58)
+ * 2. Ultrasonic Sensor: Trig 3, Echo 2
+ * 3. Status LED: Pin 12
+ */
+
+#include <Wire.h>
+
+// ==========================================
+// 1. PIN & ADDRESS DEFINITIONS
+// ==========================================
+#define MD25ADDRESS 0x58
+#define SPEED1 (byte)0x00
+#define SPEED2 0x01
+#define ENCODERONE 0x02
+#define ENCODERTWO 0x06
+#define RESETENCODERS 0x10
+#define MODESELECTOR 0xF
+
+#define trigPin 3
+#define echoPin 2
+#define ledPin 12
+
+// ==========================================
+// 2. TUNING CONSTANTS
+// ==========================================
+const int STOP = 128;
+const int SEARCH_SPEED = 20;   // Normal driving speed
+const int CREEP_SPEED = 10;    // Precision approach speed
+const int DETECT_DIST = 50;    // Cm to detect a can
+const int TARGET_DIST = 10;    // Cm to stop at the can
+const int MAX_CANS = 3;        // Mission Goal
+
+// Calibration (Adjust based on your wheels!)
+const float TICKS_PER_CM = 11.5; 
+const float TICKS_PER_DEGREE = 2.5; 
+
+// Mission State
+int cansFound = 0;
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  
+  pinMode(trigPin, OUTPUT); 
+  pinMode(echoPin, INPUT);
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
+
+  // Init MD25
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(MODESELECTOR);
+  Wire.write(0); // Mode 0 (Skid Steer)
+  Wire.endTransmission();
+  
+  delay(100);
+  resetEncoders();
+  Serial.println("--- MISSION START: Find 3 Cans ---");
+}
+
+// ==========================================
+// 3. MAIN LOOP
+// ==========================================
+void loop() {
+  // Check if mission is done
+  if (cansFound >= MAX_CANS) {
+    missionComplete();
+    return; // Stop here forever
+  }
+
+  Serial.print("Hunting for Can #"); Serial.println(cansFound + 1);
+
+  // 1. SEARCH: Drive forward up to 200cm looking for objects
+  bool foundSomething = driveWithVision(200, SEARCH_SPEED); 
+
+  if (foundSomething) {
+    // 2. APPROACH: Go to 10cm
+    approachTarget();
+    
+    // 3. ACTION: Signal success
+    signalFound();
+    cansFound++; // Increment counter
+    
+    if (cansFound < MAX_CANS) {
+      // 4. RESUME: Back up and turn to find the next one
+      Serial.println("Can processed. Repositioning...");
+      driveBlind(-20, 20); // Back up 20cm
+      turnBlind(100);      // Turn 100 degrees (slightly more than 90 to scan new area)
+    }
+  } else {
+    // We drove 2 meters and saw nothing (empty space)
+    // Turn to check a different part of the 3x2m arena
+    Serial.println("Area clear. Turning to scan new sector.");
+    turnBlind(90);
+  }
+  
+  delay(500);
+}
+
+// ==========================================
+// 4. INTELLIGENT MOVEMENT
+// ==========================================
+
+// Drive forward, looking for cans. Returns TRUE if can seen.
+bool driveWithVision(int cm, int speed) {
+  resetEncoders();
+  long targetTicks = cm * TICKS_PER_CM;
+  
+  while (abs(readEncoder()) < targetTicks) {
+    int dist = getFilteredDistance();
+    
+    // If we see a can (between 1cm and 50cm)
+    if (dist > 1 && dist < DETECT_DIST) {
+      setMotors(STOP, STOP); 
+      Serial.print("Object Spotted at: "); Serial.println(dist);
+      return true; 
+    }
+    
+    setMotors(STOP + speed, STOP + speed);
+  }
+  
+  setMotors(STOP, STOP);
+  return false; 
+}
+
+// Creep exactly to 10cm
+void approachTarget() {
+  Serial.println("Approaching...");
+  
+  // Timeout safety: Give up if it takes too long (e.g. 5 seconds)
+  unsigned long startTime = millis();
+  
+  while (millis() - startTime < 5000) {
+    int dist = getFilteredDistance();
+    
+    // Filter bad readings
+    if (dist > 100 || dist == 0) continue; 
+
+    if (dist <= TARGET_DIST) {
+      setMotors(STOP, STOP);
+      return; // Success
+    }
+    
+    // Creep forward
+    setMotors(STOP + CREEP_SPEED, STOP + CREEP_SPEED);
+    delay(50);
+  }
+  setMotors(STOP, STOP); // Stop if timed out
+}
+
+// Signal with LED
+void signalFound() {
+  Serial.println(">>> CAN CAPTURED <<<");
+  digitalWrite(ledPin, HIGH);
+  delay(3000); 
+  digitalWrite(ledPin, LOW);
+}
+
+// Final celebration state
+void missionComplete() {
+  setMotors(STOP, STOP);
+  Serial.println("--- MISSION ACCOMPLISHED: 3 CANS FOUND ---");
+  while(true) {
+    digitalWrite(ledPin, HIGH); delay(200);
+    digitalWrite(ledPin, LOW); delay(200);
+  }
+}
+
+// ==========================================
+// 5. BLIND MOVEMENT (Positioning)
+// ==========================================
+
+void driveBlind(int cm, int speed) {
+  resetEncoders();
+  long targetTicks = abs(cm * TICKS_PER_CM);
+  int motorSpeed = (cm > 0) ? (STOP + speed) : (STOP - speed);
+  
+  while (abs(readEncoder()) < targetTicks) {
+    setMotors(motorSpeed, motorSpeed);
+  }
+  setMotors(STOP, STOP);
+}
+
+void turnBlind(int degrees) {
+  resetEncoders();
+  long targetTicks = degrees * TICKS_PER_DEGREE; 
+  
+  Serial.println("Turning...");
+  while (abs(readEncoder()) < targetTicks) {
+    setMotors(STOP + 25, STOP - 25); // Spin turn
+  }
+  setMotors(STOP, STOP);
+  delay(500);
+}
+
+// ==========================================
+// 6. HELPERS
+// ==========================================
+
+int getFilteredDistance() {
+  digitalWrite(trigPin, LOW); delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH); delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 15000); 
+  int d = duration * 0.034 / 2;
+  return (d <= 0) ? 999 : d; 
+}
+
+void setMotors(int s1, int s2) {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED1); Wire.write(s1);
+  Wire.endTransmission();
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED2); Wire.write(s2);
+  Wire.endTransmission();
+}
+
+void resetEncoders() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(RESETENCODERS);
+  Wire.endTransmission();
+  delay(20);
+}
+
+long readEncoder() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(ENCODERONE);
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0;
+  long pos = Wire.read();
+  pos <<= 8; pos += Wire.read();
+  pos <<= 8; pos += Wire.read();
+  pos <<= 8; pos += Wire.read();
+  return pos;
+}
