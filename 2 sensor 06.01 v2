@@ -1,0 +1,249 @@
+/* * AUTONOMOUS SEARCH (DUAL SENSOR + BOUNDARY SAFE)
+ * * Hardware:
+ * 1. MD25 Motor Driver (I2C Address 0x58)
+ * 2. Left Sensor: Trig 3, Echo 2
+ * 3. Right Sensor: Trig 9, Echo 8  <-- NEW
+ * 4. Status LED: Pin 12
+ */
+
+#include <Wire.h>
+
+// ==========================================
+// 1. PIN & ADDRESS DEFINITIONS
+// ==========================================
+#define MD25ADDRESS 0x58
+#define SPEED1 (byte)0x00
+#define SPEED2 0x01
+#define ENCODERONE 0x02
+#define ENCODERTWO 0x06
+#define RESETENCODERS 0x10
+#define MODESELECTOR 0xF
+
+// Sensor 1 (Left)
+#define trigLeft 3
+#define echoLeft 2
+
+// Sensor 2 (Right) - NEW
+#define trigRight 9
+#define echoRight 8
+
+#define ledPin 12
+
+// ==========================================
+// 2. CONSTANTS & CALIBRATION
+// ==========================================
+const int STOP = 128;
+const int SCAN_DIST = 50;   // Distance to detect a can (cm)
+const int WALL_DIST = 20;   // Distance to detect a wall (cm)
+const int TARGET_DIST = 10; // Stop distance for approach (cm)
+
+// BOUNDARY SAFETY
+// The arena is 1.5m wide. We limit the max blind drive to 1.2m (1200mm).
+// This prevents the robot from driving out of the area if facing the short side.
+const long MAX_DRIVE_MM = 1200; 
+
+// ENCODER CALIBRATION (Adjust based on your wheels!)
+const float TICKS_PER_MM = 1.0; 
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  
+  // Init Sensor Pins
+  pinMode(trigLeft, OUTPUT); pinMode(echoLeft, INPUT);
+  pinMode(trigRight, OUTPUT); pinMode(echoRight, INPUT); // New Pins
+  pinMode(ledPin, OUTPUT);
+  
+  // Set MD25 to Mode 0 (Skid Steer)
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(MODESELECTOR);
+  Wire.write(0);
+  Wire.endTransmission();
+  
+  encoderReset();
+  Serial.println("Dual-Sensor System Ready. Boundary Limits Set.");
+}
+
+// ==========================================
+// 3. MAIN CONTROL LOOP
+// ==========================================
+void loop() {
+  // Pattern: Drive forward safely looking for cans
+  // We use MAX_DRIVE_MM (1.2m) to ensure we stay within the 1.5m width
+  bool canFound = driveAndScan(MAX_DRIVE_MM, 25); 
+
+  if (canFound) {
+    // 1. Approach and signal
+    performApproach();
+    
+    // 2. Back up slightly to avoid hitting the can while turning
+    Serial.println("Backing up...");
+    driveBlind(-150, 20); // Back up 15cm
+    
+    // 3. Turn 90 degrees to find the next target
+    Serial.println("Turning 90 degrees...");
+    pivotTurn(90, 20);
+    
+  } else {
+    // If we drove 1.2m and saw nothing, we might be near a wall or empty space.
+    // Turn 90 degrees to stay within the box and search a new vector.
+    Serial.println("Path clear (Max Distance Reached). Turning corner.");
+    pivotTurn(90, 20);
+  }
+  
+  delay(500);
+}
+
+// ==========================================
+// 4. INTELLIGENT MOVEMENT FUNCTIONS
+// ==========================================
+
+// Drives forward while checking BOTH sensors
+bool driveAndScan(long distanceMM, int speed) {
+  encoderReset();
+  long targetTicks = distanceMM * TICKS_PER_MM;
+  
+  Serial.println("Searching path...");
+
+  while (abs(encoder1()) < targetTicks) {
+    int currentDist = getSmartDistance();
+    
+    // If EITHER sensor sees an object closer than 50cm
+    if (currentDist > 1 && currentDist < SCAN_DIST) {
+      set_speed(STOP, STOP);
+      
+      // Wall Avoidance Check:
+      // If the object appeared suddenly and is huge/very close, it might be a wall.
+      // However, for this specific task, we assume <50cm is a can.
+      Serial.print("Target Spotted at "); Serial.print(currentDist); Serial.println("cm");
+      return true; // Stop and tell loop we found it
+    }
+
+    set_speed(STOP + speed, STOP + speed);
+  }
+
+  set_speed(STOP, STOP);
+  return false; // Path clear, max distance reached
+}
+
+// Precision approach to the 10cm mark
+void performApproach() {
+  Serial.println("Approaching Can...");
+  
+  // Timeout variable to prevent getting stuck if sensor glitches
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < 8000) { // 8 second timeout
+    int d = getSmartDistance();
+    
+    // Filter out noise (0 or > 100cm)
+    if (d == 0 || d > 100) { continue; }
+    
+    if (d <= TARGET_DIST) {
+      set_speed(STOP, STOP);
+      digitalWrite(ledPin, HIGH); 
+      Serial.println("Target Locked at 10cm.");
+      delay(3000);                
+      digitalWrite(ledPin, LOW);
+      break; 
+    } else {
+      // Slow creep forward (speed 10)
+      set_speed(STOP + 10, STOP + 10);
+    }
+    delay(50);
+  }
+  set_speed(STOP, STOP); // Ensure stop after break or timeout
+}
+
+// Simple blind move function for backing up
+void driveBlind(int distanceMM, int speed) {
+  encoderReset();
+  long targetTicks = abs(distanceMM * TICKS_PER_MM);
+  
+  // Determine direction
+  int motorSpeed = (distanceMM > 0) ? (STOP + speed) : (STOP - speed);
+
+  while (abs(encoder1()) < targetTicks) {
+    set_speed(motorSpeed, motorSpeed);
+  }
+  set_speed(STOP, STOP);
+}
+
+// ==========================================
+// 5. SENSOR HELPER FUNCTIONS
+// ==========================================
+
+// Reads BOTH sensors and returns the CLOSEST object
+int getSmartDistance() {
+  int d1 = readSingleSensor(trigLeft, echoLeft);
+  delay(15); // Essential delay so Sensor 2 doesn't hear Sensor 1's echo!
+  int d2 = readSingleSensor(trigRight, echoRight);
+
+  // If both sensors fail/timeout, return 999
+  if (d1 > 900 && d2 > 900) return 999;
+  
+  // If one fails, return the other
+  if (d1 > 900) return d2;
+  if (d2 > 900) return d1;
+  
+  // If both work, return the MINIMUM (closest) distance
+  // This helps catch the can if it is slightly to the left or right
+  return min(d1, d2);
+}
+
+int readSingleSensor(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  
+  long duration = pulseIn(echo, HIGH, 30000); // 30ms timeout
+  int d = duration * 0.034 / 2;
+  return (d == 0) ? 999 : d;
+}
+
+// ==========================================
+// 6. MOTOR HELPER FUNCTIONS
+// ==========================================
+
+void set_speed(int s1, int s2) {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED1); Wire.write(constrain(s1, 0, 255));
+  Wire.endTransmission();
+
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED2); Wire.write(constrain(s2, 0, 255));
+  Wire.endTransmission();
+}
+
+void pivotTurn(int angle, int speed) {
+  encoderReset();
+  // Simplified turn logic - adjust 2.5 based on your robot's width
+  long targetTicks = angle * 2.5; 
+  
+  while (abs(encoder1()) < targetTicks) {
+    set_speed(STOP + speed, STOP - speed);
+  }
+  set_speed(STOP, STOP);
+}
+
+void encoderReset() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(RESETENCODERS); Wire.write(0x20);
+  Wire.endTransmission();
+  delay(50);
+}
+
+long encoder1() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(ENCODERONE);
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0;
+  
+  long pos = (long)Wire.read() << 24;
+  pos += (long)Wire.read() << 16;
+  pos += (long)Wire.read() << 8;
+  pos += (long)Wire.read();
+  
+  return pos;
+}
