@@ -1,0 +1,237 @@
+/* * AUTONOMOUS CAN FINDER (SINGLE SENSOR)
+ * * Hardware:
+ * 1. MD25 Motor Driver (I2C Address 0x58)
+ * 2. Ultrasonic Sensor: Trig 3, Echo 2
+ * 3. Status LED: Pin 12
+ * 4. Stepper Motor: Pins 4,5,6 (Held Idle)
+ */
+
+#include <Wire.h>
+
+// ==========================================
+// 1. PIN & ADDRESS DEFINITIONS
+// ==========================================
+#define MD25ADDRESS 0x58
+#define SPEED1 (byte)0x00
+#define SPEED2 0x01
+#define ENCODERONE 0x02
+#define ENCODERTWO 0x06
+#define RESETENCODERS 0x10
+#define MODESELECTOR 0xF
+
+// Single Ultrasonic Sensor
+#define trigPin 3
+#define echoPin 2
+
+// Indicators & Stepper
+#define ledPin 12
+#define stepPin 5
+#define dirPin 4
+#define enablePin 6
+
+// ==========================================
+// 2. TUNING CONSTANTS
+// ==========================================
+const int STOP = 128;
+const int SEARCH_SPEED = 20;   // Speed during long travel (128 + 20)
+const int CREEP_SPEED = 10;    // Speed during final 10cm approach
+const int DETECT_DIST = 50;    // Cm to spot a can and stop
+const int TARGET_DIST = 10;    // Cm to stop finally
+
+// Calibration: Change this value based on your wheel size!
+const float TICKS_PER_CM = 11.5; 
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  
+  // Init Sensor & LED
+  pinMode(trigPin, OUTPUT); 
+  pinMode(echoPin, INPUT);
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
+
+  // Init Stepper (Safety Mode)
+  pinMode(stepPin, OUTPUT); 
+  pinMode(dirPin, OUTPUT); 
+  pinMode(enablePin, OUTPUT);
+  digitalWrite(enablePin, LOW); // Engage stepper brake so it doesn't flop around
+
+  // Init MD25 to Mode 0 (Skid Steer / Tank)
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(MODESELECTOR);
+  Wire.write(0);
+  Wire.endTransmission();
+  
+  delay(100);
+  resetEncoders();
+  Serial.println("--- System Armed: Single Sensor Search ---");
+}
+
+// ==========================================
+// 3. MAIN LOOP
+// ==========================================
+void loop() {
+  // 1. SEARCH PHASE: Drive forward 2 meters (200 cm)
+  // The robot returns 'true' if it sees a can, 'false' if path is clear.
+  bool objectFound = driveWithVision(200, SEARCH_SPEED); 
+
+  if (objectFound) {
+    // 2. APPROACH PHASE: We saw something! Go to it.
+    approachTarget();
+    
+    // 3. RESET PHASE: Back up slightly and turn to find the next one
+    Serial.println("Target processed. Resuming search...");
+    driveBlind(-15, 20); // Back up 15cm to avoid hitting the can
+    turnBlind(90);       // Turn 90 degrees to look elsewhere
+  } else {
+    // Path was clear for 2 meters, turn corner
+    Serial.println("Path clear. Turning corner.");
+    turnBlind(90);
+  }
+  
+  delay(500);
+}
+
+// ==========================================
+// 4. INTELLIGENT MOVEMENT FUNCTIONS
+// ==========================================
+
+// Moves forward 'cm' distance, but STOPS immediately if sensor sees < 50cm
+bool driveWithVision(int cm, int speed) {
+  resetEncoders();
+  long targetTicks = cm * TICKS_PER_CM;
+  
+  Serial.println("Driving & Scanning...");
+  
+  // Loop continues until we reach distance OR see an object
+  while (abs(readEncoder()) < targetTicks) {
+    
+    // Check Sensor
+    int dist = getFilteredDistance();
+    
+    // If valid object detected (between 1cm and 50cm)
+    if (dist > 1 && dist < DETECT_DIST) {
+      setMotors(STOP, STOP); // BRAKE
+      Serial.print("Object Detected at: "); Serial.println(dist);
+      return true; // Report success
+    }
+    
+    // Keep Driving
+    setMotors(STOP + speed, STOP + speed);
+  }
+  
+  // We finished the distance without seeing anything
+  setMotors(STOP, STOP);
+  return false; 
+}
+
+// Creep forward slowly until exactly at TARGET_DIST (10cm)
+void approachTarget() {
+  Serial.println("Approaching Target...");
+  digitalWrite(ledPin, LOW); 
+  
+  while (true) {
+    int dist = getFilteredDistance();
+    
+    // Basic filter: If we get 0 or 999 (error), ignore this reading and try again
+    if (dist > 100 || dist == 0) {
+      continue; 
+    }
+
+    if (dist <= TARGET_DIST) {
+      // WE ARRIVED!
+      setMotors(STOP, STOP);
+      Serial.println(">>> TARGET REACHED (10cm) <<<");
+      digitalWrite(ledPin, HIGH); // LED ON
+      delay(5000);                // Wait 5 seconds
+      digitalWrite(ledPin, LOW);  // LED OFF
+      break; // Exit the loop
+    }
+    else {
+      // Still too far, creep forward
+      setMotors(STOP + CREEP_SPEED, STOP + CREEP_SPEED);
+    }
+    delay(50); // Small delay for stability
+  }
+}
+
+// ==========================================
+// 5. BLIND MOVEMENT (For Turns/Backup)
+// ==========================================
+
+void driveBlind(int cm, int speed) {
+  resetEncoders();
+  long targetTicks = abs(cm * TICKS_PER_CM);
+  int motorSpeed = (cm > 0) ? (STOP + speed) : (STOP - speed); // Handle reverse
+  
+  while (abs(readEncoder()) < targetTicks) {
+    setMotors(motorSpeed, motorSpeed);
+  }
+  setMotors(STOP, STOP);
+}
+
+void turnBlind(int degrees) {
+  resetEncoders();
+  // Tuning: Adjust 2.5 based on your robot width!
+  long targetTicks = degrees * 2.5; 
+  
+  Serial.println("Turning...");
+  while (abs(readEncoder()) < targetTicks) {
+    setMotors(STOP + 20, STOP - 20); // Pivot Turn
+  }
+  setMotors(STOP, STOP);
+  delay(500);
+}
+
+// ==========================================
+// 6. SENSOR & HARDWARE HELPERS
+// ==========================================
+
+// Wrapper for sensor reading with timeout safety
+int getFilteredDistance() {
+  digitalWrite(trigPin, LOW); delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH); delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  // Timeout 15ms (approx 2.5 meters). Prevents freezing.
+  long duration = pulseIn(echoPin, HIGH, 15000); 
+  int d = duration * 0.034 / 2;
+  
+  // Filter: Return 999 if no echo or out of range
+  return (d <= 0) ? 999 : d; 
+}
+
+void setMotors(int s1, int s2) {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED1); Wire.write(s1);
+  Wire.endTransmission();
+  
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED2); Wire.write(s2);
+  Wire.endTransmission();
+}
+
+void resetEncoders() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(RESETENCODERS);
+  Wire.endTransmission();
+  delay(20);
+}
+
+// Reads just Encoder 1 for distance tracking
+long readEncoder() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(ENCODERONE);
+  Wire.endTransmission();
+  
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0;
+  
+  long pos = Wire.read();
+  pos <<= 8; pos += Wire.read();
+  pos <<= 8; pos += Wire.read();
+  pos <<= 8; pos += Wire.read();
+  
+  return pos;
+}
