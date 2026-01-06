@@ -1,0 +1,217 @@
+/* * AUTONOMOUS SEARCH & APPROACH (90 DEG TURN)
+ * * Hardware:
+ * 1. MD25 Motor Driver (I2C Address 0x58)
+ * 2. HC-SR04 Ultrasonic Sensor (Trig: 3, Echo: 2)
+ * 3. Status LED (Pin 12)
+ */
+
+#include <Wire.h>
+
+// ==========================================
+// 1. PIN & ADDRESS DEFINITIONS
+// ==========================================
+#define MD25ADDRESS 0x58
+#define SPEED1 (byte)0x00
+#define SPEED2 0x01
+#define ENCODERONE 0x02
+#define ENCODERTWO 0x06
+#define RESETENCODERS 0x10
+#define MODESELECTOR 0xF
+
+#define trigPin 3
+#define echoPin 2
+#define ledPin 12
+
+// ==========================================
+// 2. CONSTANTS & CALIBRATION
+// ==========================================
+const int STOP = 128;
+const int SCAN_DIST = 50;   // Distance to first "notice" a can (cm)
+const int TARGET_DIST = 10; // Stop and LED distance (cm)
+
+// ENCODER CALIBRATION (Change these based on your wheel size)
+// Example: If 1000 ticks = 1 meter
+const float TICKS_PER_MM = 1.0; 
+
+// ==========================================
+// 3. SETUP
+// ==========================================
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(ledPin, OUTPUT);
+  
+  // Set MD25 to Mode 0 (Skid Steer)
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(MODESELECTOR);
+  Wire.write(0);
+  Wire.endTransmission();
+  
+  encoderReset();
+  Serial.println("System Ready. Starting Search...");
+}
+
+// ==========================================
+// 4. MAIN CONTROL LOOP
+// ==========================================
+void loop() {
+  // Pattern: Drive 2 meters forward looking for cans
+  bool canFound = driveAndScan(2000, 25); // 2000mm (2m) at speed 25
+
+  if (canFound) {
+    // 1. Approach and signal
+    performApproach();
+    
+    // 2. Back up slightly to avoid hitting the can while turning
+    Serial.println("Backing up...");
+    driveBlind(-150, 20); // Back up 150mm (15cm)
+    
+    // 3. Turn 90 degrees to find the next target (Changed from 45)
+    Serial.println("Turning 90 degrees to new sector...");
+    pivotTurn(90, 20);
+    
+  } else {
+    // If no can found in 2m, turn 90 degrees to check a new path
+    Serial.println("Path clear. Turning corner.");
+    pivotTurn(90, 20);
+  }
+  
+  delay(500);
+}
+
+// ==========================================
+// 5. CORE FUNCTIONS
+// ==========================================
+
+// Drives forward while constantly checking the ultrasonic sensor
+bool driveAndScan(long distanceMM, int speed) {
+  encoderReset();
+  long targetTicks = distanceMM * TICKS_PER_MM;
+  
+  Serial.println("Searching path...");
+
+  while (abs(encoder1()) < targetTicks) {
+    int currentDist = readDistance();
+    
+    // If we see a can (valid range 1cm - 50cm)
+    if (currentDist > 1 && currentDist < SCAN_DIST) {
+      set_speed(STOP, STOP);
+      Serial.println("Target Spotted!");
+      return true; // Exit and tell the loop we found something
+    }
+
+    set_speed(STOP + speed, STOP + speed);
+    delay(20); // Frequency of sensor checks
+  }
+
+  set_speed(STOP, STOP);
+  return false; // Path clear, no can found
+}
+
+// Precision approach to the 10cm mark
+void performApproach() {
+  Serial.println("Approaching Can...");
+  
+  while (true) {
+    int d = readDistance();
+    
+    // Filter out bad readings (0 or > 100cm probably noise)
+    if (d == 0 || d > 100) { 
+      // Do nothing, just retry loop
+      continue; 
+    }
+    
+    if (d <= TARGET_DIST) {
+      set_speed(STOP, STOP);
+      digitalWrite(ledPin, HIGH); // Shine LED
+      Serial.println("Target Locked at 10cm.");
+      delay(3000);                // Keep LED on for 3 seconds
+      digitalWrite(ledPin, LOW);
+      break; 
+    } else {
+      // Slow creep forward (speed 10)
+      set_speed(STOP + 10, STOP + 10);
+    }
+    delay(50);
+  }
+}
+
+// Simple blind move function for backing up
+void driveBlind(int distanceMM, int speed) {
+  encoderReset();
+  long targetTicks = abs(distanceMM * TICKS_PER_MM);
+  
+  // Determine direction
+  int motorSpeed = (distanceMM > 0) ? (STOP + speed) : (STOP - speed);
+
+  while (abs(encoder1()) < targetTicks) {
+    set_speed(motorSpeed, motorSpeed);
+  }
+  set_speed(STOP, STOP);
+}
+
+// ==========================================
+// 6. HELPER FUNCTIONS
+// ==========================================
+
+int readDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  long duration = pulseIn(echoPin, HIGH, 30000); // 30ms timeout
+  int d = duration * 0.034 / 2;
+  return (d == 0) ? 999 : d;
+}
+
+void set_speed(int s1, int s2) {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED1);
+  Wire.write(constrain(s1, 0, 255));
+  Wire.endTransmission();
+
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED2);
+  Wire.write(constrain(s2, 0, 255));
+  Wire.endTransmission();
+}
+
+void pivotTurn(int angle, int speed) {
+  encoderReset();
+  // Simplified turn logic - adjust 2.5 based on your robot's width
+  long targetTicks = angle * 2.5; 
+  
+  while (abs(encoder1()) < targetTicks) {
+    set_speed(STOP + speed, STOP - speed);
+  }
+  set_speed(STOP, STOP);
+}
+
+void encoderReset() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(RESETENCODERS);
+  Wire.write(0x20);
+  Wire.endTransmission();
+  delay(50);
+}
+
+long encoder1() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(ENCODERONE);
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0;
+  
+  // Reads 4 bytes to form a long (32-bit integer)
+  long pos = (long)Wire.read() << 24;
+  pos += (long)Wire.read() << 16;
+  pos += (long)Wire.read() << 8;
+  pos += (long)Wire.read();
+  
+  return pos;
+}
