@@ -247,3 +247,241 @@ long encoder1() {
   
   return pos;
 }
+
+V2:
+/* * AUTONOMOUS SEARCH (AVERAGED DUAL SENSORS)
+ * * Hardware:
+ * 1. MD25 Motor Driver (I2C Address 0x58)
+ * 2. Left Sensor: Trig 3, Echo 2
+ * 3. Right Sensor: Trig 9, Echo 8
+ * 4. Status LED: Pin 12
+ */
+
+#include <Wire.h>
+
+// ==========================================
+// 1. PIN & ADDRESS DEFINITIONS
+// ==========================================
+#define MD25ADDRESS 0x58
+#define SPEED1 (byte)0x00
+#define SPEED2 0x01
+#define ENCODERONE 0x02
+#define ENCODERTWO 0x06
+#define RESETENCODERS 0x10
+#define MODESELECTOR 0xF
+
+// Left Sensor
+#define trigLeft 3
+#define echoLeft 2
+// Right Sensor
+#define trigRight 9
+#define echoRight 8
+
+#define ledPin 12
+
+// ==========================================
+// 2. CONSTANTS & CALIBRATION
+// ==========================================
+const int STOP = 128;
+const int SCAN_DIST = 50;   // Distance to detect a can
+const int TARGET_DIST = 10; // Stop distance
+const int WALL_LIMIT = 150; // Ignore readings beyond 1.5m (Wall)
+
+// BOUNDARY SAFETY: 
+// Max drive set to 1.2m to stay safely inside 1.5m width
+const long MAX_DRIVE_MM = 1200; 
+
+// CALIBRATION (Adjust for your wheels!)
+const float TICKS_PER_MM = 1.0; 
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  
+  pinMode(trigLeft, OUTPUT); pinMode(echoLeft, INPUT);
+  pinMode(trigRight, OUTPUT); pinMode(echoRight, INPUT);
+  pinMode(ledPin, OUTPUT);
+  
+  // Set MD25 to Mode 0
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(MODESELECTOR);
+  Wire.write(0);
+  Wire.endTransmission();
+  
+  encoderReset();
+  Serial.println("System Ready: Averaging Mode Active.");
+}
+
+// ==========================================
+// 3. MAIN LOOP
+// ==========================================
+void loop() {
+  // Drive forward up to 1.2m (safe for 1.5m arena)
+  bool canFound = driveAndScan(MAX_DRIVE_MM, 25); 
+
+  if (canFound) {
+    performApproach();
+    
+    Serial.println("Backing up...");
+    driveBlind(-150, 20); // Back up 15cm
+    
+    Serial.println("Turning 90 degrees...");
+    pivotTurn(90, 20);
+    
+  } else {
+    // Reached 1.2m limit without finding a can
+    Serial.println("Boundary Limit Reached. Turning.");
+    pivotTurn(90, 20);
+  }
+  
+  delay(500);
+}
+
+// ==========================================
+// 4. INTELLIGENT MOVEMENT
+// ==========================================
+
+bool driveAndScan(long distanceMM, int speed) {
+  encoderReset();
+  long targetTicks = distanceMM * TICKS_PER_MM;
+  
+  Serial.println("Searching path...");
+
+  while (abs(encoder1()) < targetTicks) {
+    // --- THIS IS THE KEY CHANGE ---
+    int avgDist = getAveragedDistance(); 
+    
+    // Check if the AVERAGE is within detection range (1cm to 50cm)
+    if (avgDist > 1 && avgDist < SCAN_DIST) {
+      set_speed(STOP, STOP);
+      Serial.print("Target Spotted! Avg Dist: "); 
+      Serial.println(avgDist);
+      return true; 
+    }
+
+    set_speed(STOP + speed, STOP + speed);
+  }
+
+  set_speed(STOP, STOP);
+  return false; 
+}
+
+void performApproach() {
+  Serial.println("Approaching Can...");
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < 8000) { 
+    int d = getAveragedDistance();
+    
+    // Filter noise
+    if (d == 0 || d > 100) continue; 
+    
+    if (d <= TARGET_DIST) {
+      set_speed(STOP, STOP);
+      digitalWrite(ledPin, HIGH); 
+      Serial.println("Target Locked at 10cm.");
+      delay(3000);                
+      digitalWrite(ledPin, LOW);
+      break; 
+    } else {
+      set_speed(STOP + 10, STOP + 10);
+    }
+    delay(50);
+  }
+  set_speed(STOP, STOP);
+}
+
+void driveBlind(int distanceMM, int speed) {
+  encoderReset();
+  long targetTicks = abs(distanceMM * TICKS_PER_MM);
+  int motorSpeed = (distanceMM > 0) ? (STOP + speed) : (STOP - speed);
+
+  while (abs(encoder1()) < targetTicks) {
+    set_speed(motorSpeed, motorSpeed);
+  }
+  set_speed(STOP, STOP);
+}
+
+// ==========================================
+// 5. AVERAGED SENSOR LOGIC
+// ==========================================
+
+int getAveragedDistance() {
+  // 1. Read Left
+  int d1 = readSingleSensor(trigLeft, echoLeft);
+  
+  // 2. Wait to prevent crosstalk
+  delay(15); 
+  
+  // 3. Read Right
+  int d2 = readSingleSensor(trigRight, echoRight);
+
+  // --- AVERAGING LOGIC ---
+  
+  // Case A: Both sensors see a valid object (less than 1.5m wall)
+  if (d1 < WALL_LIMIT && d2 < WALL_LIMIT) {
+    int average = (d1 + d2) / 2;
+    return average;
+  }
+  
+  // Case B: Only Left sees it (Right missed or hit far wall)
+  if (d1 < WALL_LIMIT && d2 >= WALL_LIMIT) return d1;
+  
+  // Case C: Only Right sees it
+  if (d2 < WALL_LIMIT && d1 >= WALL_LIMIT) return d2;
+  
+  // Case D: Both missed (return 999)
+  return 999;
+}
+
+int readSingleSensor(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  
+  long duration = pulseIn(echo, HIGH, 30000); // 30ms timeout
+  int d = duration * 0.034 / 2;
+  return (d == 0) ? 999 : d;
+}
+
+// ==========================================
+// 6. MOTOR & ENCODER HELPERS
+// ==========================================
+
+void set_speed(int s1, int s2) {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED1); Wire.write(constrain(s1, 0, 255));
+  Wire.endTransmission();
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED2); Wire.write(constrain(s2, 0, 255));
+  Wire.endTransmission();
+}
+
+void pivotTurn(int angle, int speed) {
+  encoderReset();
+  long targetTicks = angle * 2.5; 
+  while (abs(encoder1()) < targetTicks) {
+    set_speed(STOP + speed, STOP - speed);
+  }
+  set_speed(STOP, STOP);
+}
+
+void encoderReset() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(RESETENCODERS); Wire.write(0x20);
+  Wire.endTransmission();
+  delay(50);
+}
+
+long encoder1() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(ENCODERONE);
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0;
+  long pos = (long)Wire.read() << 24;
+  pos += (long)Wire.read() << 16;
+  pos += (long)Wire.read() << 8;
+  pos += (long)Wire.read();
+  return pos;
+}
