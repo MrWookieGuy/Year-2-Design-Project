@@ -1,0 +1,185 @@
+#include <Wire.h>
+
+// ==========================================
+// 1. PIN & ADDRESS DEFINITIONS
+// ==========================================
+#define MD25ADDRESS 0x58
+#define SPEED1 (byte)0x00
+#define SPEED2 0x01
+#define ENCODERONE 0x02
+#define ENCODERTWO 0x06
+#define RESETENCODERS 0x10
+#define MODESELECTOR 0xF
+
+// Sensor 1 (Left)
+#define trigPin1 3
+#define echoPin1 2
+// Sensor 2 (Right)
+#define trigPin2 7
+#define echoPin2 8
+
+#define ledPin 12
+
+// ==========================================
+// 2. CONSTANTS & CALIBRATION
+// ==========================================
+const int STOP = 128;
+const int SCAN_DIST = 50;   // Detection range (cm)
+const int TARGET_DIST = 10; // Final stop distance (cm)
+
+// Adjust based on your wheel diameter
+const float TICKS_PER_MM = 1.0; 
+
+// ==========================================
+// 3. SETUP
+// ==========================================
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  
+  pinMode(trigPin1, OUTPUT); pinMode(echoPin1, INPUT);
+  pinMode(trigPin2, OUTPUT); pinMode(echoPin2, INPUT);
+  pinMode(ledPin, OUTPUT);
+  
+  // Set MD25 to Mode 0
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(MODESELECTOR);
+  Wire.write(0);
+  Wire.endTransmission();
+  
+  encoderReset();
+  Serial.println("Dual Sensor System Online.");
+}
+
+// ==========================================
+// 4. MAIN CONTROL LOOP
+// ==========================================
+void loop() {
+  // Pattern: Search in a 2-meter straight line
+  bool canFound = driveAndScan(2000, 20); 
+
+  if (canFound) {
+    performApproach();
+    // After signaling at a can, back up and turn to continue searching
+    moveBackward(200); 
+    pivotTurn(60, 20);
+  } else {
+    // If no can in 2m, perform a search turn
+    pivotTurn(90, 20);
+  }
+}
+
+// ==========================================
+// 5. CORE FUNCTIONS
+// ==========================================
+
+// Reads both sensors and returns the closest value
+int getSmartDistance() {
+  int d1 = readSingleSensor(trigPin1, echoPin1);
+  delay(25); // Essential delay to prevent sound crosstalk between sensors
+  int d2 = readSingleSensor(trigPin2, echoPin2);
+  
+  int closest = min(d1, d2);
+  
+  Serial.print("L:"); Serial.print(d1);
+  Serial.print(" R:"); Serial.print(d2);
+  Serial.print(" -> Closest: "); Serial.println(closest);
+  
+  return closest;
+}
+
+bool driveAndScan(long distanceMM, int speed) {
+  encoderReset();
+  long targetTicks = distanceMM * TICKS_PER_MM;
+
+  while (abs(encoder1()) < targetTicks) {
+    int currentDist = getSmartDistance();
+    
+    if (currentDist > 2 && currentDist < SCAN_DIST) {
+      set_speed(STOP, STOP);
+      return true; 
+    }
+    set_speed(STOP + speed, STOP + speed);
+  }
+  set_speed(STOP, STOP);
+  return false;
+}
+
+void performApproach() {
+  Serial.println("Locking onto target...");
+  while (true) {
+    int d = getSmartDistance();
+    if (d <= TARGET_DIST) {
+      set_speed(STOP, STOP);
+      digitalWrite(ledPin, HIGH);
+      delay(3000); // Signal for 3 seconds
+      digitalWrite(ledPin, LOW);
+      break; 
+    } else {
+      set_speed(STOP + 10, STOP + 10); // Creep forward
+    }
+    delay(40);
+  }
+}
+
+// ==========================================
+// 6. HARDWARE HELPERS
+// ==========================================
+
+int readSingleSensor(int trig, int echo) {
+  digitalWrite(trig, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  
+  long duration = pulseIn(echo, HIGH, 25000); // 25ms timeout (~4 meters)
+  int d = duration * 0.034 / 2;
+  return (d <= 0) ? 999 : d;
+}
+
+void set_speed(int s1, int s2) {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED1);
+  Wire.write(constrain(s1, 0, 255));
+  Wire.endTransmission();
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED2);
+  Wire.write(constrain(s2, 0, 255));
+  Wire.endTransmission();
+}
+
+void pivotTurn(int angle, int speed) {
+  encoderReset();
+  long targetTicks = angle * 2.5; // Calibration factor
+  while (abs(encoder1()) < targetTicks) {
+    set_speed(STOP + speed, STOP - speed);
+  }
+  set_speed(STOP, STOP);
+}
+
+void moveBackward(int distMM) {
+  encoderReset();
+  long targetTicks = distMM * TICKS_PER_MM;
+  while (abs(encoder1()) < targetTicks) {
+    set_speed(STOP - 20, STOP - 20);
+  }
+  set_speed(STOP, STOP);
+}
+
+void encoderReset() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(RESETENCODERS);
+  Wire.write(0x20);
+  Wire.endTransmission();
+  delay(50);
+}
+
+long encoder1() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(ENCODERONE);
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0;
+  return (long)Wire.read() << 24 | (long)Wire.read() << 16 | (long)Wire.read() << 8 | (long)Wire.read();
+}
