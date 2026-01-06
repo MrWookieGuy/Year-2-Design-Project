@@ -1,0 +1,271 @@
+This is a fantastic challenge. Since we have a known map, we can upgrade the robot from a "blind searcher" to a "Map-Aware Hunter."We will divide the mission into 4 Phases based on your diagram:Red Phase (The Sniper): Since the Red can is fixed (1.3m from left, 0.3m from top), we don't need to search for it. We will drive directly to its coordinates.Green Phase (The Zone Search): We navigate to the bottom-left area and turn on "Search Mode."Yellow Phase (The Zone Search): We navigate to the bottom-right area and search there.Home Phase: We drive to the Blue Square to finish.The StrategyStart: Top-Left (Orange), facing Right (towards the Blue square).Red Can: Drive 130cm forward $\to$ Turn Right 90° $\to$ Drive 30cm (Scan active).Green Can: Back up $\to$ Drive to the left side $\to$ Scan the green zone.Yellow Can: Drive to the right side $\to$ Scan the yellow zone.Collect: Drive to Top-Right (Blue).Map-Aware Autonomous CodeC++/* * MAP-AWARE CAN HUNTER (3 CANS + MAP)
+ * * Hardware: Two Ultrasonic Sensors + MD25
+ * * Mission: 
+ * * 1. Go to Fixed Red Can (1.3m x 0.3m)
+ * * 2. Find Green Can (Variable - Bottom Left)
+ * * 3. Find Yellow Can (Variable - Bottom Right)
+ * * 4. Finish at Blue Square
+ */
+
+#include <Wire.h>
+
+// ==========================================
+// 1. PIN & ADDRESS DEFINITIONS
+// ==========================================
+#define MD25ADDRESS 0x58
+#define SPEED1 (byte)0x00
+#define SPEED2 0x01
+#define ENCODERONE 0x02
+#define ENCODERTWO 0x06
+#define RESETENCODERS 0x10
+#define MODESELECTOR 0xF
+
+// Sensors
+#define trigLeft 3
+#define echoLeft 2
+#define trigRight 7
+#define echoRight 8
+#define ledPin 12
+
+// ==========================================
+// 2. CONSTANTS & CALIBRATION
+// ==========================================
+const int STOP = 128;
+const int DRIVING_SPEED = 20; 
+const int SEARCH_SPEED = 20;  
+const int TARGET_DIST = 10;   // Stop 10cm from can
+const int DETECT_DIST = 50;   // Detection range
+
+// CALIBRATION (Adjust for your wheels!)
+const float TICKS_PER_CM = 11.5; 
+const float TICKS_PER_DEG = 2.5;
+
+// Mission States
+int missionStage = 0; // 0=Red, 1=Green, 2=Yellow, 3=Finish
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  
+  pinMode(trigLeft, OUTPUT); pinMode(echoLeft, INPUT);
+  pinMode(trigRight, OUTPUT); pinMode(echoRight, INPUT);
+  pinMode(ledPin, OUTPUT);
+  
+  // Set MD25 to Mode 0
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(MODESELECTOR);
+  Wire.write(0);
+  Wire.endTransmission();
+  
+  resetEncoders();
+  Serial.println("--- MISSION START: Map Loaded ---");
+  delay(1000); // 1 sec delay before moving
+}
+
+// ==========================================
+// 3. MAIN LOOP - THE MISSION COMMANDER
+// ==========================================
+void loop() {
+  
+  switch (missionStage) {
+    
+    // --- PHASE 1: THE RED CAN (FIXED) ---
+    case 0: 
+      Serial.println("PHASE 1: Hunting Red Can (Fixed Position)");
+      // 1. Drive 130cm Forward (Past the Start box to Red X-coord)
+      driveBlind(130, DRIVING_SPEED);
+      // 2. Turn Right 90 deg (Face the can)
+      pivotTurn(90, 20);
+      // 3. Drive 30cm slowly with EYES OPEN to catch it
+      if (driveAndScan(50, 15)) { // Drive up to 50cm to be safe
+        performApproach();      // Goto 10cm & Signal
+        retreatAndReset();      // Back up 20cm
+      }
+      missionStage++; // Next Phase
+      break;
+
+    // --- PHASE 2: THE GREEN CAN (BOTTOM LEFT) ---
+    case 1:
+      Serial.println("PHASE 2: Hunting Green Can (Bottom Left)");
+      // We are currently near Red Can (facing South-ish)
+      // 1. Turn Right 90 deg (Face West/Left)
+      pivotTurn(90, 20);
+      // 2. Drive ~80cm to get to the "Green Zone" center X
+      driveBlind(80, DRIVING_SPEED);
+      // 3. Turn Left 90 deg (Face South/Down)
+      pivotTurn(-90, 20); // Negative for Left turn
+      // 4. Search Drive into the zone
+      if (driveAndScan(100, SEARCH_SPEED)) {
+         performApproach();
+         retreatAndReset();
+      } else {
+         // If we missed it, try a small wiggle search
+         pivotTurn(45, 20);
+         driveAndScan(50, SEARCH_SPEED);
+      }
+      missionStage++;
+      break;
+
+    // --- PHASE 3: THE YELLOW CAN (BOTTOM RIGHT) ---
+    case 2:
+      Serial.println("PHASE 3: Hunting Yellow Can (Bottom Right)");
+      // We are in bottom left. Need to go to bottom right.
+      // 1. Back up/Turn to face East (Right)
+      pivotTurn(90, 20); // Face East
+      // 2. Drive long distance (200cm) across the arena
+      driveAndScan(200, SEARCH_SPEED); // Scan while driving, might hit it!
+      
+      // If we finished the drive without hitting it, look South
+      pivotTurn(90, 20);
+      if (driveAndScan(60, SEARCH_SPEED)) {
+         performApproach();
+         retreatAndReset();
+      }
+      missionStage++;
+      break;
+
+    // --- PHASE 4: FINISH (BLUE SQUARE) ---
+    case 3:
+      Serial.println("PHASE 4: Return to Base (Blue Square)");
+      // Navigate to Top Right. 
+      // Assuming we are in bottom right:
+      driveBlind(-50, DRIVING_SPEED); // Back up from wall
+      pivotTurn(180, 20);             // Turn around
+      driveBlind(150, DRIVING_SPEED); // Drive North to top wall
+      
+      Serial.println("MISSION COMPLETE");
+      while(true) { // Flash LED forever
+        digitalWrite(ledPin, HIGH); delay(100);
+        digitalWrite(ledPin, LOW); delay(100);
+      }
+      break;
+  }
+}
+
+// ==========================================
+// 4. MOVEMENT LOGIC
+// ==========================================
+
+// Drive fixed distance (blindly) - For getting between zones
+void driveBlind(int cm, int speed) {
+  resetEncoders();
+  long targetTicks = abs(cm * TICKS_PER_CM);
+  int ms = (cm > 0) ? (STOP + speed) : (STOP - speed);
+  
+  while (abs(readEncoder()) < targetTicks) {
+    setMotors(ms, ms);
+  }
+  setMotors(STOP, STOP);
+  delay(200);
+}
+
+// Drive while searching - Returns TRUE if can found
+bool driveAndScan(int cm, int speed) {
+  resetEncoders();
+  long targetTicks = cm * TICKS_PER_CM;
+  
+  while (abs(readEncoder()) < targetTicks) {
+    // Check Sensors
+    int dist = getSmartDistance();
+    if (dist > 1 && dist < DETECT_DIST) {
+      setMotors(STOP, STOP);
+      Serial.println("Target Found!");
+      return true; 
+    }
+    setMotors(STOP + speed, STOP + speed);
+  }
+  setMotors(STOP, STOP);
+  return false; 
+}
+
+void performApproach() {
+  Serial.println("Approaching...");
+  unsigned long t = millis();
+  while (millis() - t < 6000) { // 6 sec timeout
+    int d = getSmartDistance();
+    if (d == 0 || d > 100) continue; // Filter noise
+
+    if (d <= TARGET_DIST) {
+      setMotors(STOP, STOP);
+      // Signal
+      digitalWrite(ledPin, HIGH); delay(2000); digitalWrite(ledPin, LOW);
+      return;
+    }
+    setMotors(STOP + 10, STOP + 10); // Creep speed
+    delay(40);
+  }
+  setMotors(STOP, STOP);
+}
+
+// Standard "Back up and Turn" sequence after finding a can
+void retreatAndReset() {
+  Serial.println("Resetting Position...");
+  driveBlind(-20, 20); // Back up 20cm
+}
+
+void pivotTurn(int deg, int speed) {
+  resetEncoders();
+  long targetTicks = abs(deg * TICKS_PER_DEG);
+  
+  // Positive deg = Right Turn, Negative = Left Turn
+  int leftSpd = (deg > 0) ? (STOP + speed) : (STOP - speed);
+  int rightSpd = (deg > 0) ? (STOP - speed) : (STOP + speed);
+
+  while (abs(readEncoder()) < targetTicks) {
+    setMotors(leftSpd, rightSpd);
+  }
+  setMotors(STOP, STOP);
+  delay(500);
+}
+
+// ==========================================
+// 5. SENSORS & HARDWARE
+// ==========================================
+
+int getSmartDistance() {
+  int d1 = readSensor(trigLeft, echoLeft);
+  delay(15);
+  int d2 = readSensor(trigRight, echoRight);
+  
+  if (d1 > 900) return d2;
+  if (d2 > 900) return d1;
+  return min(d1, d2);
+}
+
+int readSensor(int t, int e) {
+  digitalWrite(t, LOW); delayMicroseconds(2);
+  digitalWrite(t, HIGH); delayMicroseconds(10);
+  digitalWrite(t, LOW);
+  long dur = pulseIn(e, HIGH, 20000);
+  int d = dur * 0.034 / 2;
+  return (d <= 0) ? 999 : d;
+}
+
+void setMotors(int s1, int s2) {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED1); Wire.write(s1);
+  Wire.endTransmission();
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED2); Wire.write(s2);
+  Wire.endTransmission();
+}
+
+void resetEncoders() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(RESETENCODERS); Wire.write(0x20);
+  Wire.endTransmission();
+  delay(50);
+}
+
+long readEncoder() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(ENCODERONE);
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0;
+  long pos = (long)Wire.read() << 24;
+  pos += (long)Wire.read() << 16;
+  pos += (long)Wire.read() << 8;
+  pos += (long)Wire.read();
+  return pos;
+}
