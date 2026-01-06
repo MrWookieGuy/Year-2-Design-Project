@@ -82,13 +82,13 @@ void loop() {
     
     // 3. Turn 90 degrees to find the next target
     Serial.println("Turning 90 degrees...");
-    pivotTurn(90, 20);
+    pivotTurn(95, 20);
     
   } else {
     // If we drove 1.2m and saw nothing, we might be near a wall or empty space.
     // Turn 90 degrees to stay within the box and search a new vector.
     Serial.println("Path clear (Max Distance Reached). Turning corner.");
-    pivotTurn(90, 20);
+    pivotTurn(95, 20);
   }
   
   delay(500);
