@@ -1,0 +1,355 @@
+/* * INTERPLANETARY ROBOT - AUTONOMOUS MISSION V3
+ * * Hardware:
+ * 1. MD25 Motor Driver (0x58)
+ * 2. Left Sensor: 3/2 | Right Sensor: 9/8
+ * 3. Status LED: 12
+ * * Logic: Approach -> Grab -> Reverse 20cm -> Straighten -> Turn 180 -> Return to Wall
+ */
+
+#include <Wire.h>
+
+// ==========================================
+// 1. CONSTANTS & PINS
+// ==========================================
+#define MD25ADDRESS 0x58
+#define SPEED1 (byte)0x00
+#define SPEED2 0x01
+#define ENCODERONE 0x02
+#define ENCODERTWO 0x06
+#define RESETENCODERS 0x10
+#define MODESELECTOR 0xF
+
+#define trigLeft 3
+#define echoLeft 2
+#define trigRight 9
+#define echoRight 8
+#define ledPin 12
+
+const int STOP = 128;
+const int BASE_SPEED = 20;
+const int TURN_SPEED = 15;
+const int SCAN_DIST = 120;
+const int GRAB_DIST = 8;
+const int WALL_STOP_DIST = 15; // Stop 15cm from wall
+
+const float TICKS_PER_MM = 1.0; 
+
+// ==========================================
+// 2. GLOBAL VARIABLES
+// ==========================================
+long targetHeading = 0; // Stores our heading before we turn to grab
+
+enum RobotState {
+  STATE_STARTUP,
+  STATE_MOVE_TO_BOX,
+  STATE_SWEEP,
+  STATE_APPROACH,     // Finds and Grabs
+  STATE_INDICATE,     // LED Flash
+  STATE_REVERSE_FROM_CAN, // New: Back up 20cm
+  STATE_STRAIGHTEN,       // New: Undo the approach turn
+  STATE_TURN_180,         // New: Turn around
+  STATE_RETURN_TO_WALL,   // New: Drive to datum
+  STATE_COMPLETE
+};
+
+RobotState currentState = STATE_STARTUP;
+
+// ==========================================
+// 3. SETUP
+// ==========================================
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  
+  pinMode(trigLeft, OUTPUT); pinMode(echoLeft, INPUT);
+  pinMode(trigRight, OUTPUT); pinMode(echoRight, INPUT);
+  pinMode(ledPin, OUTPUT);
+  
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(MODESELECTOR);
+  Wire.write(0); // Mode 0: Independent Speed
+  Wire.endTransmission();
+  
+  encoderReset();
+  Serial.println("SYSTEM READY.");
+}
+
+// ==========================================
+// 4. MAIN LOOP
+// ==========================================
+void loop() {
+  
+  switch (currentState) {
+    
+    case STATE_STARTUP:
+      delay(2000); 
+      encoderReset(); 
+      delay(100);
+      Serial.println("State: MOVING TO BOX");
+      currentState = STATE_MOVE_TO_BOX;
+      break;
+
+    case STATE_MOVE_TO_BOX:
+      if (driveDistance(600, BASE_SPEED)) {
+        Serial.println("State: SWEEPING");
+        currentState = STATE_SWEEP;
+      }
+      break;
+
+    case STATE_SWEEP:
+      set_speed(STOP - TURN_SPEED, STOP + TURN_SPEED);
+      if (checkForObject()) {
+        set_speed(STOP, STOP);
+        delay(500);
+        
+        // --- CRITICAL: SAVE HEADING ---
+        // We save (LeftEnc - RightEnc). This is our "Straight" reference.
+        targetHeading = getEncoder1() - getEncoder2();
+        Serial.print("Target Locked. Heading Ref: "); 
+        Serial.println(targetHeading);
+        
+        Serial.println("State: APPROACHING");
+        currentState = STATE_APPROACH;
+      }
+      break;
+
+    case STATE_APPROACH:
+      if (performDifferentialApproach()) {
+        Serial.println("State: INDICATING");
+        currentState = STATE_INDICATE;
+      }
+      break;
+
+    case STATE_INDICATE:
+      set_speed(STOP, STOP);
+      digitalWrite(ledPin, HIGH);
+      delay(2000); // Simulate Grab Time
+      digitalWrite(ledPin, LOW);
+      
+      // Reset Encoders for the reverse move? 
+      // NO. We need the absolute values to calculate the heading difference.
+      
+      Serial.println("State: REVERSING 20cm");
+      currentState = STATE_REVERSE_FROM_CAN;
+      break;
+
+    // --- NEW LOGIC STARTS HERE ---
+
+    case STATE_REVERSE_FROM_CAN:
+      // We cannot use 'driveDistance' easily here because we want to keep
+      // track of the absolute encoders for the heading check.
+      // So we use a relative check.
+      if (driveRelative(-200)) { // Drive back 200mm
+         currentState = STATE_STRAIGHTEN;
+      }
+      break;
+
+    case STATE_STRAIGHTEN:
+      Serial.println("State: STRAIGHTENING");
+      // Pivot until (Left - Right) equals 'targetHeading'
+      if (restoreHeading()) {
+         delay(500);
+         Serial.println("State: TURN 180");
+         currentState = STATE_TURN_180;
+      }
+      break;
+
+    case STATE_TURN_180:
+      // Turn approx 180 degrees
+      // 180 deg * 2.5 ticks/deg (approx) = 450 ticks. TUNE THIS VALUE.
+      pivotTurn(450); 
+      encoderReset(); // Reset for the drive home
+      Serial.println("State: RETURNING TO WALL");
+      currentState = STATE_RETURN_TO_WALL;
+      break;
+
+    case STATE_RETURN_TO_WALL:
+      // Drive forward until sensors see the wall close up
+      if (driveUntilWall()) {
+        Serial.println("State: DATUM REACHED");
+        currentState = STATE_COMPLETE;
+      }
+      break;
+
+    case STATE_COMPLETE:
+      set_speed(STOP, STOP);
+      break;
+  }
+}
+
+// ==========================================
+// 5. COMPLEX MOVEMENT FUNCTIONS
+// ==========================================
+
+// Drives backward 20cm without resetting global encoders (preserves heading data)
+// We use a static variable to track start position only once
+bool driveRelative(long distMM) {
+  static long startVal = 0;
+  static bool initialized = false;
+  
+  if (!initialized) {
+    startVal = getEncoder1();
+    initialized = true;
+  }
+  
+  long target = abs(distMM * TICKS_PER_MM);
+  long driven = abs(getEncoder1() - startVal);
+  
+  if (driven < target) {
+    set_speed(STOP - BASE_SPEED, STOP - BASE_SPEED); // Reverse
+    return false;
+  } else {
+    set_speed(STOP, STOP);
+    initialized = false; // Reset for next time
+    return true;
+  }
+}
+
+// Pivots robot to restore the 'targetHeading' (Left - Right difference)
+bool restoreHeading() {
+  long currentHeading = getEncoder1() - getEncoder2();
+  long error = currentHeading - targetHeading;
+  
+  // Tolerance: +/- 10 ticks
+  if (abs(error) < 10) {
+    set_speed(STOP, STOP);
+    return true;
+  }
+  
+  // P-Controller for Rotation
+  // If Error > 0, it means Left > Right (We are turned Right). Need to turn Left.
+  int rotSpeed = error * 1.5; 
+  rotSpeed = constrain(rotSpeed, -30, 30);
+  
+  // To turn Left: Left Reverse, Right Forward
+  // Note: Signs might need swapping depending on your wiring!
+  set_speed(STOP - rotSpeed, STOP + rotSpeed); 
+  
+  return false;
+}
+
+bool driveUntilWall() {
+  // Use averaged sensors
+  int dL = readSensor(trigLeft, echoLeft);
+  delay(10);
+  int dR = readSensor(trigRight, echoRight);
+  int dist = min(dL, dR);
+  
+  // Filter noise
+  if (dist == 0 || dist > 200) dist = 999;
+  
+  if (dist <= WALL_STOP_DIST) {
+    set_speed(STOP, STOP);
+    return true;
+  }
+  
+  set_speed(STOP + BASE_SPEED, STOP + BASE_SPEED);
+  return false;
+}
+
+void pivotTurn(long ticks) {
+  encoderReset();
+  delay(50);
+  while(abs(getEncoder1()) < ticks) {
+    set_speed(STOP - TURN_SPEED, STOP + TURN_SPEED);
+  }
+  set_speed(STOP, STOP);
+}
+
+// ==========================================
+// 6. STANDARD FUNCTIONS (UNCHANGED)
+// ==========================================
+
+bool driveDistance(long distanceMM, int speed) {
+  long target = distanceMM * TICKS_PER_MM;
+  if (abs(getEncoder1()) < target) {
+    set_speed(STOP + speed, STOP + speed);
+    return false;
+  } else {
+    set_speed(STOP, STOP);
+    encoderReset();
+    return true;
+  }
+}
+
+bool checkForObject() {
+  int dL = readSensor(trigLeft, echoLeft); delay(10);
+  int dR = readSensor(trigRight, echoRight);
+  if ((dL > 1 && dL < SCAN_DIST) || (dR > 1 && dR < SCAN_DIST)) return true;
+  return false;
+}
+
+bool performDifferentialApproach() {
+  int dL = readSensor(trigLeft, echoLeft); delay(10);
+  int dR = readSensor(trigRight, echoRight);
+  int closest = min(dL, dR);
+  
+  if (closest > 0 && closest <= GRAB_DIST) return true;
+
+  int error = dL - dR; 
+  int turnFactor = 0;
+  
+  // Only correct if error is significant and reasonable
+  if (abs(error) > 2 && abs(error) < 50) { 
+     turnFactor = error * 1.5; 
+     turnFactor = constrain(turnFactor, -30, 30); 
+  }
+
+  set_speed(STOP + (BASE_SPEED + turnFactor), STOP + (BASE_SPEED - turnFactor));
+  return false;
+}
+
+int readSensor(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long d = pulseIn(echo, HIGH, 25000);
+  return (d == 0) ? 999 : d * 0.034 / 2;
+}
+
+void set_speed(int s1, int s2) {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED1); Wire.write(constrain(s1, 0, 255));
+  Wire.endTransmission();
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED2); Wire.write(constrain(s2, 0, 255));
+  Wire.endTransmission();
+}
+
+void encoderReset() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(RESETENCODERS); Wire.write(0x20);
+  Wire.endTransmission();
+}
+
+// Reads Encoder 1 (Left?)
+long getEncoder1() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(ENCODERONE);
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0;
+  long pos = (long)Wire.read() << 24;
+  pos += (long)Wire.read() << 16;
+  pos += (long)Wire.read() << 8;
+  pos += (long)Wire.read();
+  return pos;
+}
+
+// Reads Encoder 2 (Right?)
+long getEncoder2() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(ENCODERTWO);
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0;
+  long pos = (long)Wire.read() << 24;
+  pos += (long)Wire.read() << 16;
+  pos += (long)Wire.read() << 8;
+  pos += (long)Wire.read();
+  return pos;
+}
+
+
+
+
