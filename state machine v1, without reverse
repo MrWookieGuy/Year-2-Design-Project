@@ -1,0 +1,259 @@
+/* * INTERPLANETARY ROBOT - AUTONOMOUS STATE MACHINE
+ * Team: [Insert Team Name]
+ * * Hardware:
+ * 1. MD25 Motor Driver (I2C Address 0x58)
+ * 2. Left Sensor: Trig 3, Echo 2
+ * 3. Right Sensor: Trig 9, Echo 8
+ * 4. Status LED: Pin 12
+ * * Logic: Finite State Machine (Wait -> Travel -> Sweep -> Approach -> Indicate)
+ */
+
+#include <Wire.h>
+
+// ==========================================
+// 1. PIN & ADDRESS DEFINITIONS
+// ==========================================
+#define MD25ADDRESS 0x58
+#define SPEED1 (byte)0x00
+#define SPEED2 0x01
+#define ENCODERONE 0x02
+#define ENCODERTWO 0x06
+#define RESETENCODERS 0x10
+#define MODESELECTOR 0xF
+
+// Sensors
+#define trigLeft 3
+#define echoLeft 2
+#define trigRight 9
+#define echoRight 8
+#define ledPin 12
+
+// ==========================================
+// 2. TUNING CONSTANTS
+// ==========================================
+const int STOP = 128;
+const int BASE_SPEED = 20;      // Normal driving speed (added to 128)
+const int TURN_SPEED = 15;      // Turning speed
+const int SCAN_DIST = 120;       // Detection range (cm)
+const int GRAB_DIST = 8;        // Distance to stop and grab (cm)
+const int WALL_FILTER = 150;    // Ignore objects further than 1.5m
+
+// Encoder ticks (Calibration needed!)
+const float TICKS_PER_MM = 1.0; 
+
+// ==========================================
+// 3. STATE MACHINE DEFINITIONS
+// ==========================================
+enum RobotState {
+  STATE_STARTUP,      // Wait 2 seconds (Safety Rule)
+  // STATE_ORIENT REMOVED
+  STATE_MOVE_TO_BOX,  // Drive forward to Green Box area
+  STATE_SWEEP,        // Rotate to find the can
+  STATE_APPROACH,     // PID approach using dual sensors
+  STATE_INDICATE,     // Stop and flash LED
+  STATE_COMPLETE      // Mission done
+};
+
+RobotState currentState = STATE_STARTUP;
+
+// ==========================================
+// 4. SETUP
+// ==========================================
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  
+  pinMode(trigLeft, OUTPUT); pinMode(echoLeft, INPUT);
+  pinMode(trigRight, OUTPUT); pinMode(echoRight, INPUT);
+  pinMode(ledPin, OUTPUT);
+  
+  // MD25 Config: Mode 0 (Independent Speed Control / Skid Steer)
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(MODESELECTOR);
+  Wire.write(0);
+  Wire.endTransmission();
+  
+  encoderReset();
+  
+  Serial.println("SYSTEM READY. WAITING FOR START.");
+}
+
+// ==========================================
+// 5. MAIN LOOP (THE BRAIN)
+// ==========================================
+void loop() {
+  
+  switch (currentState) {
+    
+    // --- STATE 1: SAFETY START ---
+    case STATE_STARTUP:
+      // Requirement: 2 second delay before movement 
+      delay(2000); 
+      
+      // Reset encoders here so we start fresh for the drive
+      encoderReset(); 
+      delay(100);
+
+      Serial.println("State: MOVING TO BOX");
+      currentState = STATE_MOVE_TO_BOX; // Skip Orient, go straight to driving
+      break;
+
+    // --- STATE 2: DRIVE TO ZONE ---
+    case STATE_MOVE_TO_BOX:
+      // Drive forward approx 60cm to enter Green Zone
+      if (driveDistance(600, BASE_SPEED)) {
+        Serial.println("State: SWEEPING");
+        currentState = STATE_SWEEP;
+      }
+      break;
+
+    // --- STATE 3: SWEEP SEARCH ---
+    case STATE_SWEEP:
+      // Spin slowly Left
+      set_speed(STOP - TURN_SPEED, STOP + TURN_SPEED);
+      
+      // Check sensors
+      if (checkForObject()) {
+        set_speed(STOP, STOP); // Object Found!
+        delay(500); // Settle
+        Serial.println("State: APPROACHING");
+        currentState = STATE_APPROACH;
+      }
+      break;
+
+    // --- STATE 4: DUAL SENSOR APPROACH ---
+    case STATE_APPROACH:
+      // This function handles the centering logic
+      // It returns TRUE when we are close enough (10cm)
+      if (performDifferentialApproach()) {
+        Serial.println("State: INDICATING");
+        currentState = STATE_INDICATE;
+      }
+      break;
+
+    // --- STATE 5: SUCCESS INDICATOR ---
+    case STATE_INDICATE:
+      set_speed(STOP, STOP);
+      digitalWrite(ledPin, HIGH); // Signal found
+      delay(3000); // Hold for 3 seconds
+      digitalWrite(ledPin, LOW);
+      
+      // In future: Add Grabber Code Here
+      
+      currentState = STATE_COMPLETE;
+      break;
+
+    case STATE_COMPLETE:
+      set_speed(STOP, STOP);
+      // Do nothing, wait for reset
+      break;
+  }
+}
+
+// ==========================================
+// 6. MOVEMENT FUNCTIONS
+// ==========================================
+
+// Returns TRUE when distance reached
+bool driveDistance(long distanceMM, int speed) {
+  long target = distanceMM * TICKS_PER_MM;
+  if (abs(getEncoder()) < target) {
+    set_speed(STOP + speed, STOP + speed);
+    return false; // Still moving
+  } else {
+    set_speed(STOP, STOP);
+    encoderReset();
+    return true; // Arrived
+  }
+}
+
+// Scans for valid object
+bool checkForObject() {
+  int dL = readSensor(trigLeft, echoLeft);
+  delay(10); // Anti-crosstalk delay
+  int dR = readSensor(trigRight, echoRight);
+  
+  // Return true if EITHER sees something closer than SCAN_DIST
+  // AND it's not noise ( > 1cm)
+  if ((dL > 1 && dL < SCAN_DIST) || (dR > 1 && dR < SCAN_DIST)) {
+    return true;
+  }
+  return false;
+}
+
+// The "Cross-Eyed" Approach Logic
+bool performDifferentialApproach() {
+  int dL = readSensor(trigLeft, echoLeft);
+  delay(10);
+  int dR = readSensor(trigRight, echoRight);
+
+  // 1. Check if we are close enough to GRAB
+  // Use the MINIMUM distance to be safe
+  int closest = min(dL, dR);
+  
+  if (closest > 0 && closest <= GRAB_DIST) {
+    return true; // We are there!
+  }
+
+  // 2. Differential Steering Logic
+  int error = dL - dR; // Negative = Object is to the LEFT. Positive = Object is to the RIGHT.
+  
+  // Threshold to ignore small jitters (+/- 2cm)
+  int turnFactor = 0;
+  if (abs(error) > 2 && abs(error) < 50) { // <50 ensures we don't turn if one sensor hits a wall
+     turnFactor = error * 1.5; // Gain (Kp)
+     turnFactor = constrain(turnFactor, -30, 30); // Limit max turn speed
+  }
+
+  // 3. Drive
+  // If Left is closer (Error neg), we want to turn Left.
+  // Left Motor slows down, Right Motor speeds up.
+  int leftMotor = BASE_SPEED + turnFactor; 
+  int rightMotor = BASE_SPEED - turnFactor;
+  
+  set_speed(STOP + leftMotor, STOP + rightMotor);
+  
+  delay(50); // Control loop delay
+  return false; // Not there yet
+}
+
+// ==========================================
+// 7. HARDWARE HELPERS
+// ==========================================
+
+int readSensor(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long duration = pulseIn(echo, HIGH, 25000); // 25ms timeout (approx 4m)
+  if (duration == 0) return 999;
+  return duration * 0.034 / 2;
+}
+
+void set_speed(int s1, int s2) {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED1); Wire.write(constrain(s1, 0, 255));
+  Wire.endTransmission();
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED2); Wire.write(constrain(s2, 0, 255));
+  Wire.endTransmission();
+}
+
+void encoderReset() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(RESETENCODERS); Wire.write(0x20);
+  Wire.endTransmission();
+}
+
+long getEncoder() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(ENCODERONE);
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0;
+  long pos = (long)Wire.read() << 24;
+  pos += (long)Wire.read() << 16;
+  pos += (long)Wire.read() << 8;
+  pos += (long)Wire.read();
+  return pos;
+}
