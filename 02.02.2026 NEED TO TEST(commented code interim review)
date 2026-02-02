@@ -1,0 +1,533 @@
+/* * MISSION: INTERPLANETARY ROBOT V14
+ * ---------------------------------
+ * This code handles a robot that finds a green can, performs a specific 
+ * detour maneuver, returns to a wall, then hunts down a red can.
+ * Hardware: MD25 Motor Controller, dual ultrasonic sensors, and an LED indicator.
+ */
+
+#include <Wire.h>
+
+// --- HARDWARE ADDRESSES & MOTOR REGISTERS ---
+#define MD25ADDRESS 0x58      // The I2C address for our motor controller
+#define SPEED1 (byte)0x00      // Motor 1 speed register
+#define SPEED2 0x01           // Motor 2 speed register
+#define ENCODERONE 0x02       // Motor 1 distance tracking
+#define ENCODERTWO 0x06       // Motor 2 distance tracking
+#define RESETENCODERS 0x10    // Command to zero out distances
+#define MODESELECTOR 0xF      // Register to set how motors are controlled
+
+// --- PIN ASSIGNMENTS ---
+#define trigLeft 3            // Ping trigger for left ultrasonic
+#define echoLeft 2            // Listen pin for left ultrasonic
+#define trigRight 9           // Ping trigger for right ultrasonic
+#define echoRight 8           // Listen pin for right ultrasonic
+#define ledPin 12             // LED to show when we've found a target
+
+// --- TUNING CONSTANTS ---
+// Adjust these to change how the robot behaves physically
+const int STOP = 128;         // MD25 uses 128 as the "neutral" stop position
+const int BASE_SPEED = 25;    // Standard cruising speed
+const int TURN_SPEED = 5;     // Gentle speed for scanning/sweeping
+const int SEARCH_SPEED = 15;  // Speed while looking for the red can
+const int SCAN_DIST = 170;    // Maximum distance (cm) to care about an object
+const int GRAB_DIST = 8;      // How close we get to the can before stopping
+const int WALL_TARGET_DIST = 10; 
+const int ALIGN_TOLERANCE = 2; // Acceptable difference between sensors (cm)
+
+// --- WHEEL MATH ---
+// These translate physical degrees/distance into motor "ticks"
+const float TICKS_PER_MM = 1.0; 
+const long TICKS_FOR_180 = 1150;  
+const long TICKS_FOR_90 = TICKS_FOR_180 / 2; 
+const long TICKS_FOR_110 = (TICKS_FOR_180 * 110) / 180; 
+const long TICKS_FOR_50 = (TICKS_FOR_180 * 50) / 180; 
+
+// --- MISSION BRAINS ---
+// This enum lists every "thought" or "state" the robot can be in.
+enum RobotState {
+  STATE_STARTUP,
+  
+  // Starting moves to get clear of the starting zone
+  STATE_INIT_FWD_30,
+  STATE_INIT_TURN_90,
+  STATE_INIT_BACK_30,
+  STATE_INIT_FWD_10,
+  STATE_PRE_SWEEP_TURN_50,
+
+  // Hunting the Green Can
+  STATE_SWEEP,
+  STATE_ALIGN_GREEN,
+  STATE_APPROACH,        
+  STATE_INDICATE,        
+  STATE_REVERSE_FROM_CAN, 
+  STATE_STRAIGHTEN,
+  
+  // The "detour" move: 90 deg turn, drive 15cm, 90 deg turn
+  STATE_OFFSET_TURN_1,  
+  STATE_OFFSET_FWD,     
+  STATE_OFFSET_TURN_2,  
+
+  // Navigation back to home base
+  STATE_RETURN_TO_WALL, 
+  STATE_TURN_90_CLOCKWISE,
+  
+  // Hunting the Red Can
+  STATE_RED_SEARCH,
+  STATE_ALIGN_RED,
+  STATE_RED_APPROACH,
+  STATE_RED_INDICATE,
+  STATE_RED_REVERSE,
+  STATE_RED_TURN_AWAY,
+  STATE_RED_FINAL_REVERSE,
+  
+  // Final maneuvers to the block
+  STATE_FORWARD_10,
+  STATE_TURN_90_TO_BLOCK,
+  STATE_APPROACH_BLOCK,
+  
+  STATE_COMPLETE
+};
+
+RobotState currentState = STATE_STARTUP; // Start at the beginning
+
+// Trackers to help us calculate how far we've moved in a specific state
+long moveStartEncoder = 0; 
+long headingTarget = 0;
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin(); // Start the I2C communication
+  
+  pinMode(trigLeft, OUTPUT); pinMode(echoLeft, INPUT);
+  pinMode(trigRight, OUTPUT); pinMode(echoRight, INPUT);
+  pinMode(ledPin, OUTPUT);
+  
+  // Tell the MD25 to use Mode 0 (standard individual motor control)
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(MODESELECTOR);
+  Wire.write(0); 
+  Wire.endTransmission();
+  
+  resetHardwareEncoders(); // Start at zero
+  Serial.println("SYSTEM READY.");
+}
+
+void loop() {
+  
+  // The Switch statement is the "Decision Engine"
+  switch (currentState) {
+    
+    // Give the user 2 seconds to put the robot down before it bolts
+    case STATE_STARTUP:
+      delay(2000); 
+      resetHardwareEncoders(); 
+      delay(100);
+      enterState(STATE_INIT_FWD_30);
+      break;
+
+    // First move: Get some distance from the start
+    case STATE_INIT_FWD_30:
+      if (driveRelativeDistance(400, BASE_SPEED)) {
+        delay(500);
+        // Calculate a 90-degree turn based on current wheel positions
+        long currentHeading = getEncoder1() - getEncoder2();
+        headingTarget = currentHeading + TICKS_FOR_90;
+        currentState = STATE_INIT_TURN_90; 
+      }
+      break;
+
+    case STATE_INIT_TURN_90:
+      if (performTurnToTarget(headingTarget)) {
+        delay(500);
+        enterState(STATE_INIT_BACK_30);
+      }
+      break;
+
+    case STATE_INIT_BACK_30:
+      if (driveRelativeDistance(-300, BASE_SPEED)) {
+        enterState(STATE_INIT_FWD_10);
+      }
+      break;
+
+    case STATE_INIT_FWD_10:
+      if (driveRelativeDistance(210, BASE_SPEED)) {
+        set_speed(STOP, STOP);
+        delay(500);
+        resetHardwareEncoders(); 
+        delay(100);
+        
+        // Prepare to spin and look for that green can
+        headingTarget = TICKS_FOR_50; 
+        currentState = STATE_PRE_SWEEP_TURN_50;
+      }
+      break;
+
+    case STATE_PRE_SWEEP_TURN_50:
+      if (performTurnToTarget(headingTarget)) {
+         delay(500);
+         currentState = STATE_SWEEP;
+      }
+      break;
+
+    // Rotate slowly until the sensors pick something up
+    case STATE_SWEEP:
+      set_speed(STOP - TURN_SPEED, STOP + TURN_SPEED); 
+      if (checkForObject()) {
+        set_speed(STOP, STOP);
+        delay(500);
+        currentState = STATE_ALIGN_GREEN; 
+      }
+      break;
+
+    // Pivot until BOTH sensors see the can equally (robot is centered)
+    case STATE_ALIGN_GREEN:
+      if (performAlignment(STATE_SWEEP)) { 
+        currentState = STATE_APPROACH;
+      }
+      break;
+
+    // Drive toward the can, adjusting steering if it starts to drift
+    case STATE_APPROACH:
+      if (performDifferentialApproach()) {
+        currentState = STATE_INDICATE;
+      }
+      break;
+
+    // Flash the LED for 2 seconds to signal "Target Found"
+    case STATE_INDICATE:
+      set_speed(STOP, STOP);
+      digitalWrite(ledPin, HIGH);
+      delay(2000); 
+      digitalWrite(ledPin, LOW);
+      enterState(STATE_REVERSE_FROM_CAN);
+      break;
+
+    case STATE_REVERSE_FROM_CAN:
+      if (driveRelativeDistance(-80, BASE_SPEED)) {
+          currentState = STATE_STRAIGHTEN;
+      }
+      break;
+
+    // Spin back to the original orientation we had before we saw the can
+    case STATE_STRAIGHTEN:
+      if (returnToZeroHeading()) {
+          delay(500);
+          // Setup for the first 90-degree detour turn
+          headingTarget = -TICKS_FOR_90; 
+          currentState = STATE_OFFSET_TURN_1;
+      }
+      break;
+
+    // DETOUR: Turn left 90
+    case STATE_OFFSET_TURN_1:
+      if (performTurnToTarget(headingTarget)) {
+         delay(500);
+         enterState(STATE_OFFSET_FWD);
+      }
+      break;
+
+    // DETOUR: Drive 15cm forward
+    case STATE_OFFSET_FWD:
+      if (driveRelativeDistance(150, BASE_SPEED)) {
+         delay(500);
+         long currentHeading = getEncoder1() - getEncoder2();
+         headingTarget = currentHeading - TICKS_FOR_90; 
+         currentState = STATE_OFFSET_TURN_2;
+      }
+      break;
+
+    // DETOUR: Turn left 90 again (completes the 'around the can' path)
+    case STATE_OFFSET_TURN_2:
+      if (performTurnToTarget(headingTarget)) {
+         delay(500);
+         currentState = STATE_RETURN_TO_WALL;
+      }
+      break;
+
+    // Drive forward until we hit the wall
+    case STATE_RETURN_TO_WALL:
+      set_speed(STOP + BASE_SPEED, STOP + BASE_SPEED);
+      if (checkForWall(WALL_TARGET_DIST)) {
+          set_speed(STOP, STOP);
+          delay(500); 
+          long currentHeading = getEncoder1() - getEncoder2();
+          headingTarget = currentHeading + TICKS_FOR_90;
+          currentState = STATE_TURN_90_CLOCKWISE;
+      }
+      break;
+
+    case STATE_TURN_90_CLOCKWISE:
+      if (performTurnToTarget(headingTarget)) {
+          delay(500);
+          enterState(STATE_RED_SEARCH);
+      }
+      break;
+
+    // Move forward looking for the red can
+    case STATE_RED_SEARCH:
+       set_speed(STOP + SEARCH_SPEED, STOP + SEARCH_SPEED);
+       if (checkForObject()) {
+          set_speed(STOP, STOP);
+          delay(500);
+          currentState = STATE_ALIGN_RED;
+       }
+       break;
+
+    case STATE_ALIGN_RED:
+       if (performAlignment(STATE_RED_SEARCH)) { 
+          currentState = STATE_RED_APPROACH;
+       }
+       break;
+
+    case STATE_RED_APPROACH:
+      if (performDifferentialApproach()) {
+        currentState = STATE_RED_INDICATE;
+      }
+      break;
+
+    case STATE_RED_INDICATE:
+      set_speed(STOP, STOP);
+      digitalWrite(ledPin, HIGH);
+      delay(2000); 
+      digitalWrite(ledPin, LOW);
+      enterState(STATE_RED_REVERSE);
+      break;
+
+    case STATE_RED_REVERSE:
+      if (driveRelativeDistance(-200, BASE_SPEED)) {
+         long currentHeading = getEncoder1() - getEncoder2();
+         headingTarget = currentHeading + TICKS_FOR_110; 
+         currentState = STATE_RED_TURN_AWAY;
+      }
+      break;
+      
+    case STATE_RED_TURN_AWAY:
+      if (performTurnToTarget(headingTarget)) {
+         delay(500);
+         enterState(STATE_RED_FINAL_REVERSE);
+      }
+      break;
+      
+    case STATE_RED_FINAL_REVERSE:
+      if (driveRelativeDistance(-500, BASE_SPEED)) {
+         enterState(STATE_FORWARD_10);
+      }
+      break;
+
+    case STATE_FORWARD_10:
+      if (driveRelativeDistance(150, BASE_SPEED)) {
+          delay(500);
+          long currentHeading = getEncoder1() - getEncoder2();
+          headingTarget = currentHeading + TICKS_FOR_90;
+          currentState = STATE_TURN_90_TO_BLOCK;
+      }
+      break;
+
+    case STATE_TURN_90_TO_BLOCK:
+      if (performTurnToTarget(headingTarget)) {
+          delay(500);
+          enterState(STATE_APPROACH_BLOCK);
+      }
+      break;
+
+    // Final push towards the block until we are 5cm away
+    case STATE_APPROACH_BLOCK:
+      set_speed(STOP + BASE_SPEED, STOP + BASE_SPEED);
+      if (checkForWall(5)) { 
+          set_speed(STOP, STOP);
+          Serial.println("MISSION COMPLETE");
+          currentState = STATE_COMPLETE;
+      }
+      break;
+
+    case STATE_COMPLETE:
+      set_speed(STOP, STOP); // Sit still forever
+      break;
+  }
+}
+
+// ==========================================
+// HELPERS (The heavy lifters)
+// ==========================================
+
+// Quickly switches the robot's current state and captures current wheel position
+void enterState(RobotState newState) {
+  currentState = newState;
+  moveStartEncoder = getAvgEncoder(); 
+}
+
+// Simple average of both wheels to get distance
+long getAvgEncoder() {
+  return (getEncoder1() + getEncoder2()) / 2;
+}
+
+// Drive a specific distance in millimeters. Returns true when finished.
+bool driveRelativeDistance(long targetMM, int speed) {
+  long currentPos = getAvgEncoder();
+  long distTraveled = currentPos - moveStartEncoder;
+  long targetTicks = targetMM * TICKS_PER_MM;
+
+  if (abs(distTraveled) < abs(targetTicks)) {
+    // Determine if we need to go forward or reverse based on the target sign
+    if (targetMM > 0) set_speed(STOP + speed, STOP + speed);
+    else set_speed(STOP - speed, STOP - speed);
+    return false; 
+  } else {
+    set_speed(STOP, STOP);
+    return true;
+  }
+}
+
+// Keeps the robot looking at the target by comparing left/right sensors
+bool performAlignment(RobotState fallbackState) {
+  int dL = readSensor(trigLeft, echoLeft); delay(5);
+  int dR = readSensor(trigRight, echoRight);
+
+  // If we lose sight of the can, jump back to scanning
+  if ((dL > SCAN_DIST || dL == 999) && (dR > SCAN_DIST || dR == 999)) {
+    currentState = fallbackState; 
+    return false;
+  }
+
+  int error = dL - dR;
+  if (abs(error) <= ALIGN_TOLERANCE) {
+    set_speed(STOP, STOP); // Close enough to center!
+    delay(200); 
+    return true;
+  }
+
+  // Spin in place to reduce the error between sensors
+  int rotSpeed = 10; 
+  if (error > 0) set_speed(STOP + rotSpeed, STOP - rotSpeed);
+  else set_speed(STOP - rotSpeed, STOP + rotSpeed);
+  
+  return false;
+}
+
+// Drives forward while steering slightly to keep the can centered
+bool performDifferentialApproach() {
+  int dL = readSensor(trigLeft, echoLeft); delay(10);
+  int dR = readSensor(trigRight, echoRight);
+  if (dL == 0) dL = 999; 
+  if (dR == 0) dR = 999;
+
+  int closest = min(dL, dR);
+  if (closest > 0 && closest <= GRAB_DIST) {
+    set_speed(STOP, STOP);
+    return true;
+  }
+
+  // Steering math: if Left is further away, add power to Left motor
+  int error = dL - dR; 
+  int turnFactor = error * 1.5; 
+  turnFactor = constrain(turnFactor, -30, 30);
+  set_speed(STOP + (BASE_SPEED + turnFactor), STOP + (BASE_SPEED - turnFactor));
+  return false;
+}
+
+// Pivots until the wheel encoders are roughly equal again
+bool returnToZeroHeading() {
+  long heading = getEncoder1() - getEncoder2();
+  if (abs(heading) < 10) { 
+    set_speed(STOP, STOP);
+    return true; 
+  }
+  // Slow down the turn as we get closer to the target (proportional control)
+  int turnPower = abs(heading) / 4; 
+  turnPower = constrain(turnPower, 15, 25); 
+  if (heading < 0) set_speed(STOP + turnPower, STOP - turnPower); 
+  else set_speed(STOP - turnPower, STOP + turnPower); 
+  return false; 
+}
+
+// Pivots to a specific encoder difference target
+bool performTurnToTarget(long target) {
+  long currentHeading = getEncoder1() - getEncoder2();
+  long error = currentHeading - target;
+
+  if (abs(error) < 15) { 
+    set_speed(STOP, STOP);
+    return true;
+  }
+  int turnPower = abs(error) / 4;
+  turnPower = constrain(turnPower, 15, 25);
+
+  if (error > 0) set_speed(STOP - turnPower, STOP + turnPower); 
+  else set_speed(STOP + turnPower, STOP - turnPower);
+  
+  return false;
+}
+
+// Simple check to see if we are about to hit something
+bool checkForWall(int limitCM) {
+  int dL = readSensor(trigLeft, echoLeft); delay(5);
+  int dR = readSensor(trigRight, echoRight);
+  if (dL == 0) dL = 999;
+  if (dR == 0) dR = 999;
+  if (dL <= limitCM || dR <= limitCM) return true;
+  return false;
+}
+
+// ==========================================
+// LOW-LEVEL HARDWARE (Talking to MD25)
+// ==========================================
+
+void resetHardwareEncoders() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(RESETENCODERS); Wire.write(0x20); // MD25 specific reset command
+  Wire.endTransmission();
+}
+
+bool checkForObject() {
+  int dL = readSensor(trigLeft, echoLeft); delay(10);
+  int dR = readSensor(trigRight, echoRight);
+  // Returns true if anything is within our scan range but not right against the lens
+  if ((dL > 1 && dL < SCAN_DIST) || (dR > 1 && dR < SCAN_DIST)) return true;
+  return false;
+}
+
+// Standard Ultrasonic Trigger/Echo logic
+int readSensor(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long d = pulseIn(echo, HIGH, 25000); // 25ms timeout
+  return (d == 0) ? 999 : d * 0.034 / 2; // Convert sound speed to cm
+}
+
+// Sends speed commands over I2C to the motor board
+void set_speed(int s1, int s2) {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED1); Wire.write(constrain(s1, 0, 255));
+  Wire.endTransmission();
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED2); Wire.write(constrain(s2, 0, 255));
+  Wire.endTransmission();
+}
+
+// Requests 4 bytes from the MD25 to assemble the 32-bit encoder value
+long getEncoder1() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(ENCODERONE);
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0;
+  long pos = (long)Wire.read() << 24;
+  pos += (long)Wire.read() << 16;
+  pos += (long)Wire.read() << 8;
+  pos += (long)Wire.read();
+  return pos;
+}
+
+long getEncoder2() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(ENCODERTWO);
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0;
+  long pos = (long)Wire.read() << 24;
+  pos += (long)Wire.read() << 16;
+  pos += (long)Wire.read() << 8;
+  pos += (long)Wire.read();
+  return pos;
+}
