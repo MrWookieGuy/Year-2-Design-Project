@@ -71,12 +71,12 @@ enum RobotState {
   STATE_YELLOW_APPROACH,  
   STATE_YELLOW_INDICATE,  
 
-  // --- NEW: RETURN TO COLLECT ZONE ---
+  // --- NEW: RETURN TO START (HOME) ---
   STATE_YELLOW_REVERSE,    // Back up from yellow can
   STATE_TURN_TO_WALL,      // Turn Left (North)
-  STATE_DRIVE_TO_WALL,     // Drive to top wall
-  STATE_ALIGN_COLLECT,     // Turn Right (East)
-  STATE_ENTER_COLLECT,     // Drive into blue box
+  STATE_DRIVE_TO_WALL,     // Drive to top wall (Wall Reset logic)
+  STATE_ALIGN_START,       // Turn Left (West) towards Start
+  STATE_DRIVE_HOME,        // Long drive to Start box
   
   STATE_COMPLETE
 };
@@ -309,7 +309,7 @@ void loop() {
        enterState(STATE_YELLOW_REVERSE);
        break;
 
-    // --- PART 6: RETURN TO COLLECT ZONE ---
+    // --- PART 6: RETURN TO START (HOME) ---
     
     case STATE_YELLOW_REVERSE:
        // 1. Back up 20cm to clear the can
@@ -324,39 +324,38 @@ void loop() {
     case STATE_TURN_TO_WALL:
        if (performTurnToTarget(headingTarget)) {
           delay(500);
-          Serial.println("State: DRIVING TO TOP WALL");
+          Serial.println("State: FINDING WALL (RESET)");
           currentState = STATE_DRIVE_TO_WALL;
        }
        break;
 
     case STATE_DRIVE_TO_WALL:
-       // Drive forward fast-ish
+       // Drive forward until we see the wall (Same logic as Reset to Wall)
        set_speed(STOP + BASE_SPEED, STOP + BASE_SPEED);
        
-       // Stop if we see the wall within 15cm
-       if (checkForWall(15)) { 
+       if (checkForWall(WALL_TARGET_DIST)) { 
           set_speed(STOP, STOP);
           delay(500);
           
           long currentHeading = getEncoder1() - getEncoder2();
-          // Turn Right (Clockwise) to face the Blue Corner
-          headingTarget = currentHeading + TICKS_FOR_90;
-          Serial.println("State: ALIGNING TO COLLECT");
-          currentState = STATE_ALIGN_COLLECT;
+          // Turn LEFT (Anti-Clockwise) to face Start/Home
+          headingTarget = currentHeading - TICKS_FOR_90;
+          Serial.println("State: ALIGNING TO START");
+          currentState = STATE_ALIGN_START;
        }
        break;
 
-    case STATE_ALIGN_COLLECT:
+    case STATE_ALIGN_START:
        if (performTurnToTarget(headingTarget)) {
           delay(500);
-          Serial.println("State: ENTERING COLLECT ZONE");
-          enterState(STATE_ENTER_COLLECT);
+          Serial.println("State: DRIVING HOME");
+          enterState(STATE_DRIVE_HOME);
        }
        break;
 
-    case STATE_ENTER_COLLECT:
-       // Drive forward 40cm into the blue box
-       if (driveRelativeDistance(400, BASE_SPEED)) {
+    case STATE_DRIVE_HOME:
+       // Drive 2 meters (2000mm) to get back to the start box
+       if (driveRelativeDistance(2000, BASE_SPEED)) {
           currentState = STATE_COMPLETE;
        }
        break;
