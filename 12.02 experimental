@@ -1,6 +1,3 @@
-
-Complete Code
-C++
 #include <Wire.h> // Include I2C library for communication with the MD25 controller
 
 // ==========================================
@@ -62,10 +59,9 @@ enum RobotState {
   STATE_RED_INDICATE,        // Triggering visual feedback for Red can success
   
   // --- MODIFIED END SEQUENCE STATES ---
-  STATE_RED_REVERSE,          // Back up from Red Can
-  STATE_TURN_TO_FINAL_WALL,   // Turn Left to face the wall
-  STATE_DRIVE_TO_FINAL_WALL,  // Drive until wall detected
-  STATE_TURN_RIGHT_FINISH,    // Turn Right 90 degrees and STOP
+  STATE_RED_CLEAR_CAN,       // Slight reverse to avoid hitting the can
+  STATE_TURN_RIGHT_90,       // Turn Right 90 degrees
+  STATE_REVERSE_INTO_WALL,   // Drive backwards 30cm
   
   STATE_COMPLETE              // Mission termination state
 };
@@ -277,48 +273,35 @@ void loop() {
       delay(2000);                // Hold for 2 seconds
       digitalWrite(ledPin, LOW);  // Turn off LED
       Serial.println("State: REVERSING FROM RED"); // Log transition
-      enterState(STATE_RED_REVERSE);               // Switch state
+      enterState(STATE_RED_CLEAR_CAN);               // Switch state
       break;
 
-    // --- NEW LOGIC: RETURN TO WALL & TURN RIGHT & STOP ---
+    // --- NEW LOGIC: CLEAR CAN -> TURN RIGHT 90 -> REVERSE 30CM ---
 
-    case STATE_RED_REVERSE:
-      if (driveRelativeDistance(-200, BASE_SPEED)) { // Back away 20cm
-         Serial.println("State: TURNING TO WALL");
+    case STATE_RED_CLEAR_CAN:
+      if (driveRelativeDistance(-100, BASE_SPEED)) { // Back away just 10cm to clear chassis
+         Serial.println("State: TURNING RIGHT 90");
          long currentHeading = getEncoder1() - getEncoder2(); 
-         // Turn Left (-90) to face the wall (assuming wall is 'North' relative to can)
-         headingTarget = currentHeading - TICKS_FOR_90;      
-         currentState = STATE_TURN_TO_FINAL_WALL;
+         // Turn Right (+90)
+         headingTarget = currentHeading + TICKS_FOR_90;      
+         currentState = STATE_TURN_RIGHT_90;
       }
       break;
       
-    case STATE_TURN_TO_FINAL_WALL:
+    case STATE_TURN_RIGHT_90:
       if (performTurnToTarget(headingTarget)) { 
          delay(500);
-         Serial.println("State: DRIVING TO WALL (FINAL)"); 
-         currentState = STATE_DRIVE_TO_FINAL_WALL;
+         Serial.println("State: REVERSING 30CM INTO WALL"); 
+         enterState(STATE_REVERSE_INTO_WALL);
       }
       break;
       
-    case STATE_DRIVE_TO_FINAL_WALL:
-      set_speed(STOP + BASE_SPEED, STOP + BASE_SPEED); // Drive forward
-      // Reuse the same wall detection function
-      if (checkForWall(WALL_TARGET_DIST)) { 
+    case STATE_REVERSE_INTO_WALL:
+      // Drive backwards 300 ticks (30cm)
+      if (driveRelativeDistance(-300, BASE_SPEED)) { 
           set_speed(STOP, STOP);
-          delay(500);
-          Serial.println("State: TURNING RIGHT (FINISH)");
-          
-          long currentHeading = getEncoder1() - getEncoder2();
-          // Turn RIGHT (+90)
-          headingTarget = currentHeading + TICKS_FOR_90; 
-          currentState = STATE_TURN_RIGHT_FINISH;
-      }
-      break;
-
-    case STATE_TURN_RIGHT_FINISH:
-      if (performTurnToTarget(headingTarget)) { 
-         Serial.println("MISSION COMPLETE - STOPPED"); 
-         currentState = STATE_COMPLETE;
+          Serial.println("MISSION COMPLETE - PARKED");
+          currentState = STATE_COMPLETE;
       }
       break;
 
