@@ -1,3 +1,15 @@
+Here is the updated code.
+
+I have updated the End Sequence with your new requirements:
+
+Reverse 40cm into Wall: The robot reverses 400 ticks. If it hits the wall, the wheels should slip slightly to physically align (square up) the robot.
+
+Reset Encoders: Since we physically aligned against the wall, I added a command to reset the encoders to 0. This tells the robot "You are now perfectly straight."
+
+Turn Left 90: Using this new perfect alignment, it executes a precise 90-degree Left turn.
+
+Complete Code
+C++
 #include <Wire.h> // Include I2C library for communication with the MD25 controller
 
 // ==========================================
@@ -61,7 +73,8 @@ enum RobotState {
   // --- MODIFIED END SEQUENCE STATES ---
   STATE_RED_CLEAR_CAN,       // Slight reverse to avoid hitting the can
   STATE_TURN_RIGHT_90,       // Turn Right 90 degrees
-  STATE_REVERSE_INTO_WALL,   // Drive backwards 30cm
+  STATE_REVERSE_INTO_WALL,   // Drive backwards 40cm (Align)
+  STATE_FINAL_LEFT_TURN,     // Turn Left 90 degrees
   
   STATE_COMPLETE              // Mission termination state
 };
@@ -276,10 +289,10 @@ void loop() {
       enterState(STATE_RED_CLEAR_CAN);               // Switch state
       break;
 
-    // --- NEW LOGIC: CLEAR CAN -> TURN RIGHT 90 -> REVERSE 30CM ---
+    // --- NEW LOGIC START ---
 
     case STATE_RED_CLEAR_CAN:
-      if (driveRelativeDistance(-100, BASE_SPEED)) { // Back away just 10cm to clear chassis
+      if (driveRelativeDistance(-100, BASE_SPEED)) { // Back away 10cm to clear chassis
          Serial.println("State: TURNING RIGHT 90");
          long currentHeading = getEncoder1() - getEncoder2(); 
          // Turn Right (+90)
@@ -291,17 +304,32 @@ void loop() {
     case STATE_TURN_RIGHT_90:
       if (performTurnToTarget(headingTarget)) { 
          delay(500);
-         Serial.println("State: REVERSING 30CM INTO WALL"); 
+         Serial.println("State: REVERSING 40CM INTO WALL"); 
          enterState(STATE_REVERSE_INTO_WALL);
       }
       break;
       
     case STATE_REVERSE_INTO_WALL:
-      // Drive backwards 300 ticks (30cm)
-      if (driveRelativeDistance(-300, BASE_SPEED)) { 
+      // Drive backwards 400 ticks (40cm) to hit wall and align
+      if (driveRelativeDistance(-400, BASE_SPEED)) { 
           set_speed(STOP, STOP);
-          Serial.println("MISSION COMPLETE - PARKED");
-          currentState = STATE_COMPLETE;
+          delay(500);
+          
+          Serial.println("State: WALL HIT - RESETTING & TURNING LEFT");
+          // Reset encoders because we are now "squared up" to the wall
+          resetHardwareEncoders();
+          delay(100);
+          
+          // Turn Left (-90)
+          headingTarget = -TICKS_FOR_90;
+          currentState = STATE_FINAL_LEFT_TURN;
+      }
+      break;
+
+    case STATE_FINAL_LEFT_TURN:
+      if (performTurnToTarget(headingTarget)) {
+         Serial.println("MISSION COMPLETE");
+         currentState = STATE_COMPLETE;
       }
       break;
 
