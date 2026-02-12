@@ -19,180 +19,129 @@
 
 const int STOP = 128;
 const int BASE_SPEED = 25;
-const int TURN_SPEED = 5;
+const int TURN_SPEED = 15;
 const int SEARCH_SPEED = 15;
-const int SCAN_DIST = 170;
+const int SCAN_DIST = 120;
 const int GRAB_DIST = 8;
-const int WALL_TARGET_DIST = 10;
-const int ALIGN_TOLERANCE = 2;
+const int WALL_TARGET_DIST = 10; 
+const int ALIGN_TOLERANCE = 2; 
 
-const float TICKS_PER_MM = 1.0;
-const long TICKS_FOR_180 = 1150;
-const long TICKS_FOR_90 = TICKS_FOR_180 / 2;
-const long TICKS_FOR_110 = (TICKS_FOR_180 * 110) / 180;
-const long TICKS_FOR_50 = (TICKS_FOR_180 * 50) / 180;
-const long TICKS_FOR_40 = (TICKS_FOR_180 * 40) / 180;
-const long TICKS_FOR_30 = (TICKS_FOR_180 * 30) / 180;
+// --- TUNING REQUIRED ---
+const float TICKS_PER_MM = 1.0; 
+const long TICKS_FOR_180 = 1150;  
+const long TICKS_FOR_90 = TICKS_FOR_180 / 2; 
+const long TICKS_FOR_40 = (TICKS_FOR_180 * 40) / 180; 
+const long TICKS_FOR_30 = (TICKS_FOR_180 * 30) / 180; 
 
 // ==========================================
-// 2. STATE MACHINE SETUP
+// 2. GLOBAL VARIABLES
 // ==========================================
 enum RobotState {
   STATE_STARTUP,
-
-  // --- INITIAL POSITIONING ---
-  STATE_INIT_FWD_30,
-  STATE_INIT_TURN_90,
-  STATE_INIT_BACK_30,
-  STATE_INIT_FWD_10,
-  STATE_PRE_SWEEP_TURN_50,
-
+  
   // --- GREEN CAN ---
+  STATE_MOVE_TO_BOX,
   STATE_SWEEP,
   STATE_ALIGN_GREEN,
-  STATE_APPROACH,
-  STATE_INDICATE,
-  STATE_REVERSE_FROM_CAN,
+  STATE_APPROACH,      
+  STATE_INDICATE,        
+  STATE_REVERSE_FROM_CAN, 
   STATE_STRAIGHTEN,
-
-  // --- OFFSET AROUND GREEN CAN ---
-  STATE_OFFSET_TURN_1,
-  STATE_OFFSET_FWD,
-  STATE_OFFSET_TURN_2,
-
-  // --- NAVIGATE TO RED CAN ---
-  STATE_RETURN_TO_WALL,
+  
+  // --- RESET TO WALL ---
+  STATE_TURN_180,          
+  STATE_RETURN_TO_WALL, 
   STATE_TURN_90_CLOCKWISE,
-
+  
   // --- RED CAN ---
   STATE_RED_SEARCH,
   STATE_ALIGN_RED,
   STATE_RED_APPROACH,
   STATE_RED_INDICATE,
   STATE_RED_REVERSE,
-
-  // --- NAVIGATE TO YELLOW ZONE ---
+  
+  // --- YELLOW ZONE ENTRY ---
   STATE_TURN_40_CLOCKWISE,
-  STATE_DRIVE_YELLOW,
-
+  STATE_DRIVE_YELLOW,      
+  
   // --- YELLOW CAN ---
-  STATE_PRE_YELLOW_TURN,
-  STATE_YELLOW_SWEEP,
-  STATE_ALIGN_YELLOW,
-  STATE_YELLOW_APPROACH,
-  STATE_YELLOW_INDICATE,
+  STATE_PRE_YELLOW_TURN, 
+  STATE_YELLOW_SWEEP,     
+  STATE_ALIGN_YELLOW,     
+  STATE_YELLOW_APPROACH,  
+  STATE_YELLOW_INDICATE,  
 
-  // --- RETURN HOME (UPDATED) ---
-  STATE_YELLOW_REVERSE,         // Back away from yellow can
-  STATE_HOME_TURN_TO_WALL,      // Turn to face nearest wall
-  STATE_HOME_DRIVE_TO_WALL,     // Drive forward until wall hit
-  STATE_HOME_TURN_LEFT_90,      // Turn LEFT 90 degrees
-  STATE_HOME_DRIVE_TO_END,      // Drive forward until end wall hit
-
+  // --- NEW: RETURN TO COLLECT ZONE ---
+  STATE_YELLOW_REVERSE,    // Back up from yellow can
+  STATE_TURN_TO_WALL,      // Turn Left (North)
+  STATE_DRIVE_TO_WALL,     // Drive to top wall
+  STATE_ALIGN_COLLECT,     // Turn Right (East)
+  STATE_ENTER_COLLECT,     // Drive into blue box
+  
   STATE_COMPLETE
 };
 
 RobotState currentState = STATE_STARTUP;
-long moveStartEncoder = 0;
+
+// Variables to track movement 
+long moveStartEncoder = 0; 
 long headingTarget = 0;
 
 // ==========================================
-// 3. INITIALIZATION
+// 3. SETUP
 // ==========================================
 void setup() {
   Serial.begin(9600);
   Wire.begin();
-
-  pinMode(trigLeft, OUTPUT);
-  pinMode(echoLeft, INPUT);
-  pinMode(trigRight, OUTPUT);
-  pinMode(echoRight, INPUT);
+  
+  pinMode(trigLeft, OUTPUT); pinMode(echoLeft, INPUT);
+  pinMode(trigRight, OUTPUT); pinMode(echoRight, INPUT);
   pinMode(ledPin, OUTPUT);
-
+  
   Wire.beginTransmission(MD25ADDRESS);
   Wire.write(MODESELECTOR);
-  Wire.write(0);
+  Wire.write(0); 
   Wire.endTransmission();
-
+  
   resetHardwareEncoders();
-  Serial.println("SYSTEM READY. PREPARING FOR DEPLOYMENT.");
+  Serial.println("SYSTEM READY.");
 }
 
 // ==========================================
 // 4. MAIN LOOP
 // ==========================================
 void loop() {
+  
   switch (currentState) {
-
-    // ===================== STARTUP =====================
+    
+    // --- PART 1: GREEN CAN ---
     case STATE_STARTUP:
-      delay(2000);
-      resetHardwareEncoders();
+      delay(2000); 
+      resetHardwareEncoders(); 
       delay(100);
-      Serial.println("State: INIT FWD 30cm");
-      enterState(STATE_INIT_FWD_30);
+      Serial.println("State: MOVING TO BOX");
+      enterState(STATE_MOVE_TO_BOX);
       break;
 
-    // ============= INITIAL POSITIONING =================
-    case STATE_INIT_FWD_30:
-      if (driveRelativeDistance(400, BASE_SPEED)) {
-        Serial.println("State: INIT TURN 90");
-        delay(500);
-        long ch1 = getEncoder1() - getEncoder2();
-        headingTarget = ch1 + TICKS_FOR_90;
-        currentState = STATE_INIT_TURN_90;
-      }
-      break;
-
-    case STATE_INIT_TURN_90:
-      if (performTurnToTarget(headingTarget)) {
-        delay(500);
-        Serial.println("State: INIT BACK 30cm");
-        enterState(STATE_INIT_BACK_30);
-      }
-      break;
-
-    case STATE_INIT_BACK_30:
-      if (driveRelativeDistance(-300, BASE_SPEED)) {
-        Serial.println("State: INIT FWD 10cm");
-        enterState(STATE_INIT_FWD_10);
-      }
-      break;
-
-    case STATE_INIT_FWD_10:
-      if (driveRelativeDistance(210, BASE_SPEED)) {
-        set_speed(STOP, STOP);
-        delay(500);
-        Serial.println("RESETTING ENCODERS FOR TRACKING");
-        resetHardwareEncoders();
-        delay(100);
-        headingTarget = TICKS_FOR_50;
-        Serial.println("State: PRE-SWEEP TURN 50");
-        currentState = STATE_PRE_SWEEP_TURN_50;
-      }
-      break;
-
-    case STATE_PRE_SWEEP_TURN_50:
-      if (performTurnToTarget(headingTarget)) {
-        delay(500);
+    case STATE_MOVE_TO_BOX:
+      if (driveRelativeDistance(600, BASE_SPEED)) {
         Serial.println("State: SWEEPING FOR GREEN");
-        currentState = STATE_SWEEP;
+        currentState = STATE_SWEEP; 
       }
       break;
 
-    // ================= GREEN CAN =======================
     case STATE_SWEEP:
-      set_speed(STOP - TURN_SPEED, STOP + TURN_SPEED);
+      set_speed(STOP - TURN_SPEED, STOP + TURN_SPEED); 
       if (checkForObject()) {
         set_speed(STOP, STOP);
         delay(500);
         Serial.println("State: ALIGNING GREEN");
-        currentState = STATE_ALIGN_GREEN;
+        currentState = STATE_ALIGN_GREEN; 
       }
       break;
 
     case STATE_ALIGN_GREEN:
-      if (performAlignment(STATE_SWEEP)) {
+      if (performAlignment(STATE_SWEEP)) { 
         Serial.println("State: APPROACHING GREEN");
         currentState = STATE_APPROACH;
       }
@@ -208,90 +157,68 @@ void loop() {
     case STATE_INDICATE:
       set_speed(STOP, STOP);
       digitalWrite(ledPin, HIGH);
-      delay(2000);
+      delay(2000); 
       digitalWrite(ledPin, LOW);
-      Serial.println("State: REVERSING FROM GREEN");
+      Serial.println("State: REVERSING");
       enterState(STATE_REVERSE_FROM_CAN);
       break;
 
     case STATE_REVERSE_FROM_CAN:
-      if (driveRelativeDistance(-50, BASE_SPEED)) {
-        currentState = STATE_STRAIGHTEN;
+      if (driveRelativeDistance(-150, BASE_SPEED)) {
+         currentState = STATE_STRAIGHTEN;
       }
       break;
 
     case STATE_STRAIGHTEN:
       if (returnToZeroHeading()) {
-        delay(500);
-        Serial.println("State: OFFSET TURN 1 (90 ACW)");
-        headingTarget = -TICKS_FOR_90;
-        currentState = STATE_OFFSET_TURN_1;
+         Serial.println("State: TURN 180");
+         headingTarget = -TICKS_FOR_180; 
+         currentState = STATE_TURN_180;
       }
       break;
 
-    // =========== OFFSET AROUND GREEN CAN ===============
-    case STATE_OFFSET_TURN_1:
+    // --- PART 2: RESET TO WALL ---
+    case STATE_TURN_180:
       if (performTurnToTarget(headingTarget)) {
-        delay(500);
-        Serial.println("State: OFFSET FWD 15cm");
-        enterState(STATE_OFFSET_FWD);
+         delay(500); 
+         currentState = STATE_RETURN_TO_WALL;
       }
       break;
 
-    case STATE_OFFSET_FWD:
-      if (driveRelativeDistance(150, BASE_SPEED)) {
-        delay(500);
-        Serial.println("State: OFFSET TURN 2 (90 ACW)");
-        long ch2 = getEncoder1() - getEncoder2();
-        headingTarget = ch2 - TICKS_FOR_90;
-        currentState = STATE_OFFSET_TURN_2;
-      }
-      break;
-
-    case STATE_OFFSET_TURN_2:
-      if (performTurnToTarget(headingTarget)) {
-        delay(500);
-        Serial.println("State: RETURN TO WALL");
-        currentState = STATE_RETURN_TO_WALL;
-      }
-      break;
-
-    // ============= NAVIGATE TO RED CAN =================
     case STATE_RETURN_TO_WALL:
       set_speed(STOP + BASE_SPEED, STOP + BASE_SPEED);
       if (checkForWall(WALL_TARGET_DIST)) {
-        set_speed(STOP, STOP);
-        delay(500);
-        long ch3 = getEncoder1() - getEncoder2();
-        headingTarget = ch3 + TICKS_FOR_90;  // Turn RIGHT along wall
-        currentState = STATE_TURN_90_CLOCKWISE;
+         set_speed(STOP, STOP);
+         delay(500); 
+         headingTarget = headingTarget + TICKS_FOR_90;
+         currentState = STATE_TURN_90_CLOCKWISE;
       }
       break;
 
     case STATE_TURN_90_CLOCKWISE:
       if (performTurnToTarget(headingTarget)) {
-        delay(500);
-        Serial.println("State: SEARCHING RED");
-        enterState(STATE_RED_SEARCH);
+         delay(500);
+         Serial.println("State: SEARCHING RED");
+         enterState(STATE_RED_SEARCH);
       }
       break;
 
-    // =================== RED CAN =======================
+    // --- PART 3: RED CAN ---
     case STATE_RED_SEARCH:
-      set_speed(STOP + SEARCH_SPEED, STOP + SEARCH_SPEED);
-      if (checkForObject()) {
-        set_speed(STOP, STOP);
-        delay(500);
-        currentState = STATE_ALIGN_RED;
-      }
-      break;
+       set_speed(STOP + SEARCH_SPEED, STOP + SEARCH_SPEED);
+       if (checkForObject()) {
+          set_speed(STOP, STOP);
+          delay(500);
+          currentState = STATE_ALIGN_RED;
+       }
+       break;
 
     case STATE_ALIGN_RED:
-      if (performAlignment(STATE_RED_SEARCH)) {
-        Serial.println("State: APPROACHING RED");
-        currentState = STATE_RED_APPROACH;
-      }
-      break;
+       if (performAlignment(STATE_RED_SEARCH)) { 
+          Serial.println("State: APPROACHING RED");
+          currentState = STATE_RED_APPROACH;
+       }
+       break;
 
     case STATE_RED_APPROACH:
       if (performDifferentialApproach()) {
@@ -302,7 +229,7 @@ void loop() {
     case STATE_RED_INDICATE:
       set_speed(STOP, STOP);
       digitalWrite(ledPin, HIGH);
-      delay(2000);
+      delay(2000); 
       digitalWrite(ledPin, LOW);
       Serial.println("State: REVERSING FROM RED");
       enterState(STATE_RED_REVERSE);
@@ -310,134 +237,134 @@ void loop() {
 
     case STATE_RED_REVERSE:
       if (driveRelativeDistance(-200, BASE_SPEED)) {
-        Serial.println("State: TURNING 40 CW TO YELLOW ZONE");
-        long ch4 = getEncoder1() - getEncoder2();
-        headingTarget = ch4 + TICKS_FOR_40;
-        currentState = STATE_TURN_40_CLOCKWISE;
+         long currentHeading = getEncoder1() - getEncoder2();
+         headingTarget = currentHeading + TICKS_FOR_40;
+         currentState = STATE_TURN_40_CLOCKWISE;
       }
       break;
 
-    // =========== NAVIGATE TO YELLOW ZONE ===============
+    // --- PART 4: YELLOW ZONE ENTRY ---
     case STATE_TURN_40_CLOCKWISE:
       if (performTurnToTarget(headingTarget)) {
-        delay(500);
-        Serial.println("State: DRIVING TO YELLOW ZONE");
-        enterState(STATE_DRIVE_YELLOW);
+         delay(500);
+         Serial.println("State: DRIVING TO YELLOW ZONE");
+         enterState(STATE_DRIVE_YELLOW);
       }
       break;
 
     case STATE_DRIVE_YELLOW:
-      if (driveRelativeDistance(750, BASE_SPEED)) {
-        Serial.println("State: PRE-TURN 30 ANTICLOCKWISE");
-        long ch5 = getEncoder1() - getEncoder2();
-        headingTarget = ch5 - TICKS_FOR_30;
-        currentState = STATE_PRE_YELLOW_TURN;
+      if (driveRelativeDistance(750, BASE_SPEED)) { // 75cm drive
+         Serial.println("State: PRE-TURN 30 ANTICLOCKWISE");
+         long currentHeading = getEncoder1() - getEncoder2();
+         // Subtract ticks to turn Left (Anti-Clockwise)
+         headingTarget = currentHeading - TICKS_FOR_30; 
+         currentState = STATE_PRE_YELLOW_TURN;
       }
       break;
 
-    // ================= YELLOW CAN ======================
+    // --- PART 5: YELLOW CAN ---
     case STATE_PRE_YELLOW_TURN:
       if (performTurnToTarget(headingTarget)) {
-        delay(500);
-        Serial.println("State: SWEEPING YELLOW (CLOCKWISE)");
-        currentState = STATE_YELLOW_SWEEP;
+         delay(500);
+         Serial.println("State: SWEEPING YELLOW (CLOCKWISE)");
+         currentState = STATE_YELLOW_SWEEP;
       }
       break;
 
     case STATE_YELLOW_SWEEP:
-      set_speed(STOP + TURN_SPEED, STOP - TURN_SPEED);
-      if (checkForObject()) {
-        set_speed(STOP, STOP);
-        delay(500);
-        Serial.println("State: ALIGNING YELLOW");
-        currentState = STATE_ALIGN_YELLOW;
-      }
-      break;
+       // Spin Right (Clockwise)
+       set_speed(STOP + TURN_SPEED, STOP - TURN_SPEED); 
+       
+       if (checkForObject()) {
+          set_speed(STOP, STOP);
+          delay(500);
+          Serial.println("State: ALIGNING YELLOW");
+          currentState = STATE_ALIGN_YELLOW;
+       }
+       break;
 
     case STATE_ALIGN_YELLOW:
-      if (performAlignment(STATE_YELLOW_SWEEP)) {
-        Serial.println("State: APPROACHING YELLOW");
-        currentState = STATE_YELLOW_APPROACH;
-      }
-      break;
+       // If lost, go back to yellow sweep
+       if (performAlignment(STATE_YELLOW_SWEEP)) { 
+          Serial.println("State: APPROACHING YELLOW");
+          currentState = STATE_YELLOW_APPROACH;
+       }
+       break;
 
     case STATE_YELLOW_APPROACH:
       if (performDifferentialApproach()) {
-        Serial.println("State: INDICATING YELLOW");
+        Serial.println("State: YELLOW FOUND - LED ON");
         currentState = STATE_YELLOW_INDICATE;
       }
       break;
 
     case STATE_YELLOW_INDICATE:
-      set_speed(STOP, STOP);
-      digitalWrite(ledPin, HIGH);
-      delay(2000);
-      digitalWrite(ledPin, LOW);
-      Serial.println("State: REVERSING FROM YELLOW");
-      enterState(STATE_YELLOW_REVERSE);
-      break;
+       set_speed(STOP, STOP);
+       digitalWrite(ledPin, HIGH); 
+       delay(2000); 
+       digitalWrite(ledPin, LOW);
+       
+       Serial.println("State: REVERSING FROM YELLOW");
+       // Start the sequence to go home
+       enterState(STATE_YELLOW_REVERSE);
+       break;
 
-    // ========== RETURN HOME (NEW LOGIC) ================
-    //
-    //  Step 1: Reverse away from yellow can
-    //  Step 2: Turn to face the nearest wall
-    //  Step 3: Drive forward until wall is hit
-    //  Step 4: Turn LEFT 90 degrees (opposite of red section)
-    //  Step 5: Drive forward until the END wall is hit
-    //  Step 6: Done
-    //
-    // ===================================================
-
+    // --- PART 6: RETURN TO COLLECT ZONE ---
+    
     case STATE_YELLOW_REVERSE:
-      if (driveRelativeDistance(-200, BASE_SPEED)) {
-        Serial.println("State: TURNING TO FACE WALL");
-        long ch6 = getEncoder1() - getEncoder2();
-        // --- TUNE THIS ANGLE to face the nearest side wall ---
-        headingTarget = ch6 + TICKS_FOR_110;
-        currentState = STATE_HOME_TURN_TO_WALL;
-      }
-      break;
+       // 1. Back up 20cm to clear the can
+       if (driveRelativeDistance(-200, BASE_SPEED)) {
+          long currentHeading = getEncoder1() - getEncoder2();
+          // Turn Left (Anti-Clockwise) to face the Top Wall
+          headingTarget = currentHeading - TICKS_FOR_90; 
+          currentState = STATE_TURN_TO_WALL;
+       }
+       break;
 
-    case STATE_HOME_TURN_TO_WALL:
-      if (performTurnToTarget(headingTarget)) {
-        delay(500);
-        Serial.println("State: DRIVING TO WALL");
-        currentState = STATE_HOME_DRIVE_TO_WALL;
-      }
-      break;
+    case STATE_TURN_TO_WALL:
+       if (performTurnToTarget(headingTarget)) {
+          delay(500);
+          Serial.println("State: DRIVING TO TOP WALL");
+          currentState = STATE_DRIVE_TO_WALL;
+       }
+       break;
 
-    case STATE_HOME_DRIVE_TO_WALL:
-      set_speed(STOP + BASE_SPEED, STOP + BASE_SPEED); // Drive forward
-      if (checkForWall(WALL_TARGET_DIST)) {             // Until wall at 10cm
-        set_speed(STOP, STOP);
-        delay(500);
-        Serial.println("State: TURNING LEFT 90 (TOWARD END)");
-        long ch7 = getEncoder1() - getEncoder2();
-        // *** KEY CHANGE: Turn LEFT (subtract ticks) ***
-        headingTarget = ch7 - TICKS_FOR_90;
-        currentState = STATE_HOME_TURN_LEFT_90;
-      }
-      break;
+    case STATE_DRIVE_TO_WALL:
+       // Drive forward fast-ish
+       set_speed(STOP + BASE_SPEED, STOP + BASE_SPEED);
+       
+       // Stop if we see the wall within 15cm
+       if (checkForWall(15)) { 
+          set_speed(STOP, STOP);
+          delay(500);
+          
+          long currentHeading = getEncoder1() - getEncoder2();
+          // Turn Right (Clockwise) to face the Blue Corner
+          headingTarget = currentHeading + TICKS_FOR_90;
+          Serial.println("State: ALIGNING TO COLLECT");
+          currentState = STATE_ALIGN_COLLECT;
+       }
+       break;
 
-    case STATE_HOME_TURN_LEFT_90:
-      if (performTurnToTarget(headingTarget)) {
-        delay(500);
-        Serial.println("State: DRIVING TO END WALL");
-        currentState = STATE_HOME_DRIVE_TO_END;
-      }
-      break;
+    case STATE_ALIGN_COLLECT:
+       if (performTurnToTarget(headingTarget)) {
+          delay(500);
+          Serial.println("State: ENTERING COLLECT ZONE");
+          enterState(STATE_ENTER_COLLECT);
+       }
+       break;
 
-    case STATE_HOME_DRIVE_TO_END:
-      set_speed(STOP + BASE_SPEED, STOP + BASE_SPEED); // Drive forward
-      if (checkForWall(5)) {                             // Stop very close (5cm)
-        set_speed(STOP, STOP);
-        Serial.println("=== MISSION COMPLETE ===");
-        currentState = STATE_COMPLETE;
-      }
-      break;
+    case STATE_ENTER_COLLECT:
+       // Drive forward 40cm into the blue box
+       if (driveRelativeDistance(400, BASE_SPEED)) {
+          currentState = STATE_COMPLETE;
+       }
+       break;
 
     case STATE_COMPLETE:
       set_speed(STOP, STOP);
+      Serial.println("MISSION ACCOMPLISHED");
+      while(1); // Stop loop forever
       break;
   }
 }
@@ -448,7 +375,7 @@ void loop() {
 
 void enterState(RobotState newState) {
   currentState = newState;
-  moveStartEncoder = getAvgEncoder();
+  moveStartEncoder = getAvgEncoder(); 
 }
 
 long getAvgEncoder() {
@@ -463,42 +390,42 @@ bool driveRelativeDistance(long targetMM, int speed) {
   if (abs(distTraveled) < abs(targetTicks)) {
     if (targetMM > 0) set_speed(STOP + speed, STOP + speed);
     else set_speed(STOP - speed, STOP - speed);
-    return false;
+    return false; 
   } else {
     set_speed(STOP, STOP);
     return true;
   }
 }
 
+// Returns TRUE when centered. 
 bool performAlignment(RobotState fallbackState) {
-  int dL = readSensor(trigLeft, echoLeft);
-  delay(5);
+  int dL = readSensor(trigLeft, echoLeft); delay(5);
   int dR = readSensor(trigRight, echoRight);
 
+  // Safety: If object lost, go back to search
   if ((dL > SCAN_DIST || dL == 999) && (dR > SCAN_DIST || dR == 999)) {
-    currentState = fallbackState;
+    currentState = fallbackState; 
     return false;
   }
 
   int error = dL - dR;
   if (abs(error) <= ALIGN_TOLERANCE) {
     set_speed(STOP, STOP);
-    delay(200);
+    delay(200); 
     return true;
   }
 
-  int rotSpeed = 10;
+  int rotSpeed = 10; 
   if (error > 0) set_speed(STOP + rotSpeed, STOP - rotSpeed);
   else set_speed(STOP - rotSpeed, STOP + rotSpeed);
-
+  
   return false;
 }
 
 bool performDifferentialApproach() {
-  int dL = readSensor(trigLeft, echoLeft);
-  delay(10);
+  int dL = readSensor(trigLeft, echoLeft); delay(10);
   int dR = readSensor(trigRight, echoRight);
-  if (dL == 0) dL = 999;
+  if (dL == 0) dL = 999; 
   if (dR == 0) dR = 999;
 
   int closest = min(dL, dR);
@@ -507,8 +434,8 @@ bool performDifferentialApproach() {
     return true;
   }
 
-  int error = dL - dR;
-  int turnFactor = error * 1.5;
+  int error = dL - dR; 
+  int turnFactor = error * 1.5; 
   turnFactor = constrain(turnFactor, -30, 30);
   set_speed(STOP + (BASE_SPEED + turnFactor), STOP + (BASE_SPEED - turnFactor));
   return false;
@@ -516,37 +443,36 @@ bool performDifferentialApproach() {
 
 bool returnToZeroHeading() {
   long heading = getEncoder1() - getEncoder2();
-  if (abs(heading) < 10) {
+  if (abs(heading) < 10) { 
     set_speed(STOP, STOP);
-    return true;
+    return true; 
   }
-  int turnPower = abs(heading) / 4;
-  turnPower = constrain(turnPower, 15, 25);
-  if (heading < 0) set_speed(STOP + turnPower, STOP - turnPower);
-  else set_speed(STOP - turnPower, STOP + turnPower);
-  return false;
+  int turnPower = abs(heading) / 4; 
+  turnPower = constrain(turnPower, 15, 25); 
+  if (heading < 0) set_speed(STOP + turnPower, STOP - turnPower); 
+  else set_speed(STOP - turnPower, STOP + turnPower); 
+  return false; 
 }
 
 bool performTurnToTarget(long target) {
   long currentHeading = getEncoder1() - getEncoder2();
   long error = currentHeading - target;
 
-  if (abs(error) < 15) {
+  if (abs(error) < 15) { 
     set_speed(STOP, STOP);
     return true;
   }
   int turnPower = abs(error) / 4;
   turnPower = constrain(turnPower, 15, 25);
 
-  if (error > 0) set_speed(STOP - turnPower, STOP + turnPower);
+  if (error > 0) set_speed(STOP - turnPower, STOP + turnPower); 
   else set_speed(STOP + turnPower, STOP - turnPower);
-
+  
   return false;
 }
 
 bool checkForWall(int limitCM) {
-  int dL = readSensor(trigLeft, echoLeft);
-  delay(5);
+  int dL = readSensor(trigLeft, echoLeft); delay(5);
   int dR = readSensor(trigRight, echoRight);
   if (dL == 0) dL = 999;
   if (dR == 0) dR = 999;
@@ -555,29 +481,25 @@ bool checkForWall(int limitCM) {
 }
 
 // ==========================================
-// 6. HARDWARE INTERFACE
+// 6. HARDWARE HELPERS
 // ==========================================
 
 void resetHardwareEncoders() {
   Wire.beginTransmission(MD25ADDRESS);
-  Wire.write(RESETENCODERS);
-  Wire.write(0x20);
+  Wire.write(RESETENCODERS); Wire.write(0x20);
   Wire.endTransmission();
 }
 
 bool checkForObject() {
-  int dL = readSensor(trigLeft, echoLeft);
-  delay(10);
+  int dL = readSensor(trigLeft, echoLeft); delay(10);
   int dR = readSensor(trigRight, echoRight);
   if ((dL > 1 && dL < SCAN_DIST) || (dR > 1 && dR < SCAN_DIST)) return true;
   return false;
 }
 
 int readSensor(int trig, int echo) {
-  digitalWrite(trig, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trig, HIGH);
-  delayMicroseconds(10);
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
   digitalWrite(trig, LOW);
   long d = pulseIn(echo, HIGH, 25000);
   return (d == 0) ? 999 : d * 0.034 / 2;
@@ -585,12 +507,10 @@ int readSensor(int trig, int echo) {
 
 void set_speed(int s1, int s2) {
   Wire.beginTransmission(MD25ADDRESS);
-  Wire.write(SPEED1);
-  Wire.write(constrain(s1, 0, 255));
+  Wire.write(SPEED1); Wire.write(constrain(s1, 0, 255));
   Wire.endTransmission();
   Wire.beginTransmission(MD25ADDRESS);
-  Wire.write(SPEED2);
-  Wire.write(constrain(s2, 0, 255));
+  Wire.write(SPEED2); Wire.write(constrain(s2, 0, 255));
   Wire.endTransmission();
 }
 
