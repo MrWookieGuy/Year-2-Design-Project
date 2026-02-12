@@ -61,9 +61,10 @@ enum RobotState {
   // --- MODIFIED END SEQUENCE STATES ---
   STATE_RED_CLEAR_CAN,       // Slight reverse to avoid hitting the can
   STATE_TURN_RIGHT_90,       // Turn Right 90 degrees
-  STATE_REVERSE_INTO_WALL,   // Drive backwards 40cm (Align)
-  STATE_FORWARD_FROM_WALL,   // NEW: Drive forward 10cm
+  STATE_REVERSE_INTO_WALL,   // Drive backwards (Align)
+  STATE_FORWARD_FROM_WALL,   // Drive forward (Your tweaked distance)
   STATE_FINAL_LEFT_TURN,     // Turn Left 90 degrees
+  STATE_DRIVE_TO_FINISH,     // NEW: Drive 60cm to finish
   
   STATE_COMPLETE              // Mission termination state
 };
@@ -278,13 +279,13 @@ void loop() {
       enterState(STATE_RED_CLEAR_CAN);               // Switch state
       break;
 
-    // --- NEW LOGIC START ---
+    // --- END SEQUENCE ---
 
     case STATE_RED_CLEAR_CAN:
-      if (driveRelativeDistance(-100, BASE_SPEED)) { // Back away 10cm to clear chassis
+      // Tweaked by user: -100
+      if (driveRelativeDistance(-100, BASE_SPEED)) { 
          Serial.println("State: TURNING RIGHT 90");
          long currentHeading = getEncoder1() - getEncoder2(); 
-         // Turn Right (+90)
          headingTarget = currentHeading + TICKS_FOR_90;      
          currentState = STATE_TURN_RIGHT_90;
       }
@@ -293,36 +294,33 @@ void loop() {
     case STATE_TURN_RIGHT_90:
       if (performTurnToTarget(headingTarget)) { 
          delay(500);
-         Serial.println("State: REVERSING 40CM INTO WALL"); 
+         Serial.println("State: REVERSING INTO WALL"); 
          enterState(STATE_REVERSE_INTO_WALL);
       }
       break;
       
     case STATE_REVERSE_INTO_WALL:
-      // Drive backwards 400 ticks (40cm) to hit wall and align
-      if (driveRelativeDistance(-400, BASE_SPEED)) { 
+      // Drive backwards 500 ticks to hit wall (User's value)
+      if (driveRelativeDistance(-500, BASE_SPEED)) { 
           set_speed(STOP, STOP);
           delay(500);
           
           Serial.println("State: WALL HIT - RESETTING ENCODERS");
-          // Reset encoders because we are now "squared up" to the wall
           resetHardwareEncoders();
           delay(100);
           
-          Serial.println("State: FORWARD 10CM");
-          enterState(STATE_FORWARD_FROM_WALL); // Go to new forward state
+          Serial.println("State: FORWARD FROM WALL");
+          enterState(STATE_FORWARD_FROM_WALL); 
       }
       break;
 
     case STATE_FORWARD_FROM_WALL:
-      // NEW: Drive forward 10cm (100 ticks)
-      if (driveRelativeDistance(100, BASE_SPEED)) {
+      // Tweaked by user: 190
+      if (driveRelativeDistance(190, BASE_SPEED)) {
          set_speed(STOP, STOP);
          delay(500);
          
          Serial.println("State: TURNING LEFT 90");
-         // Since encoders were reset at the wall, and we drove straight,
-         // current heading is ~0. Target is -90 for LEFT turn.
          headingTarget = -TICKS_FOR_90;
          currentState = STATE_FINAL_LEFT_TURN;
       }
@@ -330,8 +328,17 @@ void loop() {
 
     case STATE_FINAL_LEFT_TURN:
       if (performTurnToTarget(headingTarget)) {
-         Serial.println("MISSION COMPLETE");
-         currentState = STATE_COMPLETE;
+         delay(500);
+         Serial.println("State: DRIVE 60CM TO FINISH");
+         enterState(STATE_DRIVE_TO_FINISH);
+      }
+      break;
+
+    case STATE_DRIVE_TO_FINISH:
+      // Drive forward 60cm (600 ticks)
+      if (driveRelativeDistance(600, BASE_SPEED)) {
+          Serial.println("MISSION COMPLETE");
+          currentState = STATE_COMPLETE;
       }
       break;
 
@@ -386,135 +393,4 @@ bool performAlignment(RobotState fallbackState) {
     return true;           // Alignment successful
   }
 
-  int rotSpeed = 10; // Fixed motor power for alignment pivots
-  if (error > 0) set_speed(STOP + rotSpeed, STOP - rotSpeed); // Pivot right
-  else set_speed(STOP - rotSpeed, STOP + rotSpeed);           // Pivot left
-  
-  return false; // Alignment in progress
-}
-
-bool performDifferentialApproach() {
-  int dL = readSensor(trigLeft, echoLeft);   // Refresh left sensor data
-  delay(10);                                 // Dwell to avoid interference
-  int dR = readSensor(trigRight, echoRight); // Refresh right sensor data
-  if (dL == 0) dL = 999;                     // Filter zero-reading errors
-  if (dR == 0) dR = 999;                     // Filter zero-reading errors
-
-  int closest = min(dL, dR); // Determine proximity to the target
-  if (closest > 0 && closest <= GRAB_DIST) { // Check if stop distance is reached
-    set_speed(STOP, STOP); // Halt motors
-    return true;           // Approach finished
-  }
-
-  int error = dL - dR;       // Calculate deviation from center
-  int turnFactor = error * 1.5; // Scale error for proportional steering
-  turnFactor = constrain(turnFactor, -30, 30); // Limit maximum steering correction
-  set_speed(STOP + (BASE_SPEED + turnFactor), STOP + (BASE_SPEED - turnFactor)); // Apply steering
-  return false; // Approach in progress
-}
-
-bool returnToZeroHeading() {
-  long heading = getEncoder1() - getEncoder2(); // Get current orientation delta
-  if (abs(heading) < 10) { // Check if robot is straight enough
-    set_speed(STOP, STOP); // Halt pivot
-    return true;           // Orientation restored
-  }
-  int turnPower = abs(heading) / 4; // Proportional power based on error
-  turnPower = constrain(turnPower, 15, 25); // Ensure motors actually move
-  if (heading < 0) set_speed(STOP + turnPower, STOP - turnPower); // Correct right
-  else set_speed(STOP - turnPower, STOP + turnPower);             // Correct left
-  return false; // Correction in progress
-}
-
-bool performTurnToTarget(long target) {
-  long currentHeading = getEncoder1() - getEncoder2(); // Get current differential
-  long error = currentHeading - target;                // Calculate angular error
-
-  if (abs(error) < 15) {   // Check for arrival within tolerance zone
-    set_speed(STOP, STOP); // Halt pivot
-    return true;           // Turn finished
-  }
-  int turnPower = abs(error) / 4; // Proportional power for smooth turn
-  turnPower = constrain(turnPower, 15, 25); // Clamp power values
-
-  if (error > 0) set_speed(STOP - turnPower, STOP + turnPower); // Pivot clockwise
-  else set_speed(STOP + turnPower, STOP - turnPower);            // Pivot counter-clockwise
-  
-  return false; // Turn in progress
-}
-
-bool checkForWall(int limitCM) {
-  int dL = readSensor(trigLeft, echoLeft);   // Check left sensor for wall
-  delay(5);                                  // Sensor dwell
-  int dR = readSensor(trigRight, echoRight); // Check right sensor for wall
-  if (dL == 0) dL = 999; // Error handling for left sensor
-  if (dR == 0) dR = 999; // Error handling for right sensor
-  if (dL <= limitCM || dR <= limitCM) return true; // Wall detected within threshold
-  return false; // Path is clear
-}
-
-// ==========================================
-// 6. HARDWARE INTERFACE (Low Level)
-// ==========================================
-
-void resetHardwareEncoders() {
-  Wire.beginTransmission(MD25ADDRESS); // Initialize comms with motor controller
-  Wire.write(RESETENCODERS);           // Target the command register
-  Wire.write(0x20);                    // Send specific byte to zero out encoders
-  Wire.endTransmission();              // Close communication
-}
-
-bool checkForObject() {
-  int dL = readSensor(trigLeft, echoLeft);   // Look for objects on the left
-  delay(10);                                 // Sensor dwell
-  int dR = readSensor(trigRight, echoRight); // Look for objects on the right
-  if ((dL > 1 && dL < SCAN_DIST) || (dR > 1 && dR < SCAN_DIST)) return true; // Object found
-  return false; // No object in scan range
-}
-
-int readSensor(int trig, int echo) {
-  digitalWrite(trig, LOW);             // Ensure trigger is low
-  delayMicroseconds(2);                // Hold for stability
-  digitalWrite(trig, HIGH);            // Set trigger high to start pulse
-  delayMicroseconds(10);               // Send 10us burst
-  digitalWrite(trig, LOW);             // Reset trigger
-  long d = pulseIn(echo, HIGH, 25000); // Measure time until echo with 25ms timeout
-  return (d == 0) ? 999 : d * 0.034 / 2; // Convert duration to cm or return max if failed
-}
-
-void set_speed(int s1, int s2) {
-  Wire.beginTransmission(MD25ADDRESS); // Talk to MD25
-  Wire.write(SPEED1);                  // Target motor 1
-  Wire.write(constrain(s1, 0, 255));   // Clamp and send speed
-  Wire.endTransmission();              // End command
-  Wire.beginTransmission(MD25ADDRESS); // Talk to MD25 again
-  Wire.write(SPEED2);                  // Target motor 2
-  Wire.write(constrain(s2, 0, 255));   // Clamp and send speed
-  Wire.endTransmission();              // End command
-}
-
-long getEncoder1() {
-  Wire.beginTransmission(MD25ADDRESS); // Select MD25 address
-  Wire.write(ENCODERONE);              // Request motor 1 encoder register
-  Wire.endTransmission();              // End request header
-  Wire.requestFrom(MD25ADDRESS, 4);    // Ask for 4 bytes of data
-  if (Wire.available() < 4) return 0;  // Exit if data packet is incomplete
-  long pos = (long)Wire.read() << 24;  // Read byte 1 (MSB)
-  pos += (long)Wire.read() << 16;      // Read byte 2
-  pos += (long)Wire.read() << 8;       // Read byte 3
-  pos += (long)Wire.read();            // Read byte 4 (LSB)
-  return pos;                          // Return constructed 32-bit value
-}
-
-long getEncoder2() {
-  Wire.beginTransmission(MD25ADDRESS); // Select MD25 address
-  Wire.write(ENCODERTWO);              // Request motor 2 encoder register
-  Wire.endTransmission();              // End request header
-  Wire.requestFrom(MD25ADDRESS, 4);    // Ask for 4 bytes of data
-  if (Wire.available() < 4) return 0;  // Exit if data packet is incomplete
-  long pos = (long)Wire.read() << 24;  // Read byte 1 (MSB)
-  pos += (long)Wire.read() << 16;      // Read byte 2
-  pos += (long)Wire.read() << 8;       // Read byte 3
-  pos += (long)Wire.read();            // Read byte 4 (LSB)
-  return pos;                          // Return constructed 32-bit value
-}
+  int rot
