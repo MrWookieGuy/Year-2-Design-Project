@@ -58,16 +58,22 @@ enum RobotState {
   STATE_RED_APPROACH,
   STATE_RED_INDICATE,
   
-  // --- MODIFIED END SEQUENCE STATES ---
+  // --- TRANSITION TO THIRD CAN ---
   STATE_RED_CLEAR_CAN,       // Back up 10cm
   STATE_TURN_RIGHT_90,       // Turn Right 90
   STATE_REVERSE_INTO_WALL,   // Back up 50cm into wall
   STATE_FORWARD_FROM_WALL,   // Forward 19cm
   STATE_FINAL_LEFT_TURN,     // Turn Left 90
-  
   STATE_LONG_DRIVE_140,      // Drive 140cm
   STATE_TURN_RIGHT_ALIGN,    // Turn Right 90
   STATE_REVERSE_ALIGN_FINAL, // Back up 50cm into wall
+  
+  // --- THIRD CAN (YELLOW) SEARCH ---
+  STATE_FORWARD_TO_SEARCH,   // Forward 20cm from wall
+  STATE_YELLOW_SWEEP,        // Spin and look
+  STATE_YELLOW_ALIGN,        // Dual eye align
+  STATE_YELLOW_APPROACH,     // Drive to can
+  STATE_YELLOW_INDICATE,     // Stop and LED
   
   STATE_COMPLETE
 };
@@ -280,10 +286,9 @@ void loop() {
       enterState(STATE_RED_CLEAR_CAN);
       break;
 
-    // --- END SEQUENCE ---
+    // --- TRANSITION SEQUENCE ---
 
     case STATE_RED_CLEAR_CAN:
-      // TWEAK: -100 ticks
       if (driveRelativeDistance(-100, BASE_SPEED)) { 
          Serial.println("State: TURNING RIGHT 90");
          long currentHeading = getEncoder1() - getEncoder2(); 
@@ -301,26 +306,21 @@ void loop() {
       break;
       
     case STATE_REVERSE_INTO_WALL:
-      // TWEAK: -500 ticks
       if (driveRelativeDistance(-500, BASE_SPEED)) { 
           set_speed(STOP, STOP);
           delay(500);
-          
           Serial.println("State: WALL HIT - RESETTING ENCODERS");
           resetHardwareEncoders();
           delay(100);
-          
           Serial.println("State: FORWARD FROM WALL");
           enterState(STATE_FORWARD_FROM_WALL); 
       }
       break;
 
     case STATE_FORWARD_FROM_WALL:
-      // TWEAK: 190 ticks
       if (driveRelativeDistance(190, BASE_SPEED)) {
          set_speed(STOP, STOP);
          delay(500);
-         
          Serial.println("State: TURNING LEFT 90");
          headingTarget = -TICKS_FOR_90;
          currentState = STATE_FINAL_LEFT_TURN;
@@ -336,7 +336,6 @@ void loop() {
       break;
 
     case STATE_LONG_DRIVE_140:
-      // TWEAK: 1400 ticks (140cm)
       if (driveRelativeDistance(1400, BASE_SPEED)) {
           Serial.println("State: TURN RIGHT ALIGN");
           delay(500);
@@ -355,11 +354,64 @@ void loop() {
       break;
 
     case STATE_REVERSE_ALIGN_FINAL:
-      // Back up 50cm (500 ticks) to hit wall
+      // Back up 50cm (500 ticks) to hit wall and straighten
       if (driveRelativeDistance(-500, BASE_SPEED)) {
-          Serial.println("MISSION COMPLETE");
-          currentState = STATE_COMPLETE;
+          set_speed(STOP, STOP);
+          delay(500);
+          
+          Serial.println("State: WALL HIT (2) - RESETTING ENCODERS");
+          resetHardwareEncoders(); // Reset so we drive straight out
+          delay(100);
+          
+          Serial.println("State: FORWARD 20CM TO SEARCH");
+          enterState(STATE_FORWARD_TO_SEARCH);
       }
+      break;
+      
+    // --- THIRD CAN (YELLOW) SEARCH ---
+
+    case STATE_FORWARD_TO_SEARCH:
+      // Drive forward 20cm (200 ticks) to clear wall
+      if (driveRelativeDistance(200, BASE_SPEED)) {
+          Serial.println("State: SWEEPING FOR YELLOW");
+          currentState = STATE_YELLOW_SWEEP;
+      }
+      break;
+
+    case STATE_YELLOW_SWEEP:
+      // Same detection method as first can: Spin slowly
+      set_speed(STOP - TURN_SPEED, STOP + TURN_SPEED);
+      if (checkForObject()) {
+        set_speed(STOP, STOP);
+        delay(500);
+        Serial.println("State: ALIGNING YELLOW");
+        currentState = STATE_YELLOW_ALIGN;
+      }
+      break;
+
+    case STATE_YELLOW_ALIGN:
+      // Same alignment logic
+      if (performAlignment(STATE_YELLOW_SWEEP)) {
+        Serial.println("State: APPROACHING YELLOW");
+        currentState = STATE_YELLOW_APPROACH;
+      }
+      break;
+
+    case STATE_YELLOW_APPROACH:
+      // Same approach logic
+      if (performDifferentialApproach()) {
+        Serial.println("State: INDICATING YELLOW");
+        currentState = STATE_YELLOW_INDICATE;
+      }
+      break;
+
+    case STATE_YELLOW_INDICATE:
+      set_speed(STOP, STOP);
+      digitalWrite(ledPin, HIGH);
+      delay(2000);
+      digitalWrite(ledPin, LOW);
+      Serial.println("MISSION COMPLETE");
+      currentState = STATE_COMPLETE;
       break;
 
     case STATE_COMPLETE:
