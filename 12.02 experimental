@@ -1,288 +1,286 @@
-#include <Wire.h> // Include I2C library for communication with the MD25 controller
+#include <Wire.h>
 
 // ==========================================
 // 1. CONSTANTS & PINS
 // ==========================================
-#define MD25ADDRESS 0x58      // Define the I2C address for the MD25 motor controller
-#define SPEED1 (byte)0x00     // Register address for Motor 1 speed control
-#define SPEED2 0x01           // Register address for Motor 2 speed control
-#define ENCODERONE 0x02       // Register address for Motor 1 encoder data
-#define ENCODERTWO 0x06       // Register address for Motor 2 encoder data
-#define RESETENCODERS 0x10    // Command byte to reset encoder counts to zero
-#define MODESELECTOR 0xF      // Register to set the operational mode of the MD25
+#define MD25ADDRESS 0x58
+#define SPEED1 (byte)0x00
+#define SPEED2 0x01
+#define ENCODERONE 0x02
+#define ENCODERTWO 0x06
+#define RESETENCODERS 0x10
+#define MODESELECTOR 0xF
 
-#define trigLeft 3            // Digital output pin for the left ultrasonic trigger
-#define echoLeft 2            // Digital input pin for the left ultrasonic echo
-#define trigRight 9           // Digital output pin for the right ultrasonic trigger
-#define echoRight 8           // Digital input pin for the right ultrasonic echo
-#define ledPin 12             // Digital output pin for the status indicator LED
+#define trigLeft 3
+#define echoLeft 2
+#define trigRight 9
+#define echoRight 8
+#define ledPin 12
 
-const int STOP = 128;              // Mid-point value for zero velocity in MD25 Mode 0
-const int BASE_SPEED = 25;         // Standard motor power for forward/reverse movement
-const int TURN_SPEED = 5;          // Minimal motor power for precise rotational scanning
-const int SEARCH_SPEED = 15;       // Reduced speed for safer object detection phases
-const int SCAN_DIST = 170;         // Maximum detection range in cm for scanning objects
-const int GRAB_DIST = 8;           // Target distance in cm to stop before an object
-const int WALL_TARGET_DIST = 10;   // Proximity threshold for detecting arena boundaries
-const int ALIGN_TOLERANCE = 2;     // Allowed error margin in cm for dual-sensor alignment
+const int STOP = 128;
+const int BASE_SPEED = 25;
+const int TURN_SPEED = 5;
+const int SEARCH_SPEED = 15;
+const int SCAN_DIST = 170;
+const int GRAB_DIST = 8;
+const int WALL_TARGET_DIST = 10;
+const int ALIGN_TOLERANCE = 2;
 
-const float TICKS_PER_MM = 1.0;    // Calibration factor for converting mm to encoder ticks
-const long TICKS_FOR_180 = 1150;   // Empirical encoder count for a 180-degree pivot
-const long TICKS_FOR_90 = TICKS_FOR_180 / 2;                // Calculated ticks for a 90-degree turn
-const long TICKS_FOR_110 = (TICKS_FOR_180 * 110) / 180;     // Calculated ticks for a 110-degree turn
-const long TICKS_FOR_50 = (TICKS_FOR_180 * 50) / 180;       // Calculated ticks for a 50-degree turn
+const float TICKS_PER_MM = 1.0;
+const long TICKS_FOR_180 = 1150;
+const long TICKS_FOR_90 = TICKS_FOR_180 / 2;
+const long TICKS_FOR_110 = (TICKS_FOR_180 * 110) / 180;
+const long TICKS_FOR_50 = (TICKS_FOR_180 * 50) / 180;
 
 // ==========================================
 // 2. STATE MACHINE SETUP
 // ==========================================
 enum RobotState {
-  STATE_STARTUP,             // Initial wait state before mission execution
-  STATE_INIT_FWD_30,         // Initial forward movement to clear start zone
-  STATE_INIT_TURN_90,        // Primary rotation to orient toward the field
-  STATE_INIT_BACK_30,        // Backward adjustment for positioning
-  STATE_INIT_FWD_10,         // Final pre-search forward nudge
-  STATE_PRE_SWEEP_TURN_50,   // Orientation adjustment before scanning
-  STATE_SWEEP,               // Active scanning for the Green target can
-  STATE_ALIGN_GREEN,         // Aligning robot heading to the Green can center
-  STATE_APPROACH,            // Navigating toward the detected Green can
-  STATE_INDICATE,            // Triggering visual feedback for Green can success
-  STATE_REVERSE_FROM_CAN,    // Retreating from the Green can location
-  STATE_STRAIGHTEN,          // Correcting heading back to global zero
-  STATE_OFFSET_TURN_1,       // Turning to bypass the Green can obstacle
-  STATE_OFFSET_FWD,          // Moving forward to clear the obstacle area
-  STATE_OFFSET_TURN_2,       // Turning back to resume the main path
-  STATE_RETURN_TO_WALL,      // Navigating toward a wall for position reset
-  STATE_TURN_90_CLOCKWISE,   // Rotating to search for the Red target can
-  STATE_RED_SEARCH,          // Scanning for the Red target can
-  STATE_ALIGN_RED,           // Aligning robot heading to the Red can center
-  STATE_RED_APPROACH,        // Navigating toward the detected Red can
-  STATE_RED_INDICATE,        // Triggering visual feedback for Red can success
+  STATE_STARTUP,
+  STATE_INIT_FWD_30,
+  STATE_INIT_TURN_90,
+  STATE_INIT_BACK_30,
+  STATE_INIT_FWD_10,
+  STATE_PRE_SWEEP_TURN_50,
+  STATE_SWEEP,
+  STATE_ALIGN_GREEN,
+  STATE_APPROACH,
+  STATE_INDICATE,
+  STATE_REVERSE_FROM_CAN,
+  STATE_STRAIGHTEN,
+  STATE_OFFSET_TURN_1,
+  STATE_OFFSET_FWD,
+  STATE_OFFSET_TURN_2,
+  STATE_RETURN_TO_WALL,
+  STATE_TURN_90_CLOCKWISE,
+  STATE_RED_SEARCH,
+  STATE_ALIGN_RED,
+  STATE_RED_APPROACH,
+  STATE_RED_INDICATE,
   
   // --- MODIFIED END SEQUENCE STATES ---
-  STATE_RED_CLEAR_CAN,       // Slight reverse to avoid hitting the can
-  STATE_TURN_RIGHT_90,       // Turn Right 90 degrees
-  STATE_REVERSE_INTO_WALL,   // Drive backwards (Align)
-  STATE_FORWARD_FROM_WALL,   // Drive forward (Your tweaked distance)
-  STATE_FINAL_LEFT_TURN,     // Turn Left 90 degrees
-  STATE_DRIVE_TO_FINISH,     // NEW: Drive 60cm to finish
+  STATE_RED_CLEAR_CAN,       // Back up 10cm
+  STATE_TURN_RIGHT_90,       // Turn Right 90
+  STATE_REVERSE_INTO_WALL,   // Back up 50cm into wall
+  STATE_FORWARD_FROM_WALL,   // Forward 19cm
+  STATE_FINAL_LEFT_TURN,     // Turn Left 90
+  STATE_DRIVE_TO_FINISH,     // Drive 60cm to finish
   
-  STATE_COMPLETE              // Mission termination state
+  STATE_COMPLETE
 };
 
-RobotState currentState = STATE_STARTUP; // Initialize the system in the startup state
-long moveStartEncoder = 0;               // Variable to store encoder value at start of a move
-long headingTarget = 0;                  // Target heading based on encoder differential
+RobotState currentState = STATE_STARTUP;
+long moveStartEncoder = 0;
+long headingTarget = 0;
 
 // ==========================================
 // 3. INITIALIZATION
 // ==========================================
 void setup() {
-  Serial.begin(9600);        // Initialize serial communication for debugging logs
-  Wire.begin();              // Initialize the I2C communication bus
+  Serial.begin(9600);
+  Wire.begin();
   
-  pinMode(trigLeft, OUTPUT); // Configure left trigger pin as an output
-  pinMode(echoLeft, INPUT);  // Configure left echo pin as an input
-  pinMode(trigRight, OUTPUT);// Configure right trigger pin as an output
-  pinMode(echoRight, INPUT); // Configure right echo pin as an input
-  pinMode(ledPin, OUTPUT);   // Configure LED pin as an output
+  pinMode(trigLeft, OUTPUT); pinMode(echoLeft, INPUT);
+  pinMode(trigRight, OUTPUT); pinMode(echoRight, INPUT);
+  pinMode(ledPin, OUTPUT);
   
-  Wire.beginTransmission(MD25ADDRESS); // Start I2C transmission to motor controller
-  Wire.write(MODESELECTOR);            // Select the mode register
-  Wire.write(0);                       // Set mode to 0 (individual speed/throttle)
-  Wire.endTransmission();              // Finalize I2C transmission
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(MODESELECTOR);
+  Wire.write(0);
+  Wire.endTransmission();
   
-  resetHardwareEncoders();             // Set hardware encoder registers to zero
-  Serial.println("SYSTEM READY. PREPARING FOR DEPLOYMENT."); // Log readiness
+  resetHardwareEncoders();
+  Serial.println("SYSTEM READY.");
 }
 
 // ==========================================
 // 4. THE BRAIN (MAIN LOOP)
 // ==========================================
 void loop() {
-  switch (currentState) { // Execute logic based on the active state
+  switch (currentState) {
     
     case STATE_STARTUP:
-      delay(2000);             // Pause to allow environment stabilization
-      resetHardwareEncoders(); // Ensure encoders start at zero
-      delay(100);              // Short delay for register update
-      Serial.println("State: INIT FWD 30cm"); // Log transition
-      enterState(STATE_INIT_FWD_30); // Transition to forward move
+      delay(2000);
+      resetHardwareEncoders();
+      delay(100);
+      Serial.println("State: INIT FWD 30cm");
+      enterState(STATE_INIT_FWD_30);
       break;
 
     case STATE_INIT_FWD_30:
-      if (driveRelativeDistance(400, BASE_SPEED)) { // Move forward 400 ticks
-        Serial.println("State: INIT TURN 90");      // Log transition
-        delay(500);                                 // Dwell before next action
-        long currentHeading = getEncoder1() - getEncoder2(); // Calculate current delta
-        headingTarget = currentHeading + TICKS_FOR_90;       // Calculate target delta
-        currentState = STATE_INIT_TURN_90;                   // Switch state
+      if (driveRelativeDistance(400, BASE_SPEED)) {
+        Serial.println("State: INIT TURN 90");
+        delay(500);
+        long currentHeading = getEncoder1() - getEncoder2();
+        headingTarget = currentHeading + TICKS_FOR_90;
+        currentState = STATE_INIT_TURN_90;
       }
       break;
 
     case STATE_INIT_TURN_90:
-      if (performTurnToTarget(headingTarget)) { // Execute pivot to target
-        delay(500);                             // Dwell after turn
-        Serial.println("State: INIT BACK 30cm");// Log transition
-        enterState(STATE_INIT_BACK_30);         // Switch state
+      if (performTurnToTarget(headingTarget)) {
+        delay(500);
+        Serial.println("State: INIT BACK 30cm");
+        enterState(STATE_INIT_BACK_30);
       }
       break;
 
     case STATE_INIT_BACK_30:
-      if (driveRelativeDistance(-300, BASE_SPEED)) { // Move backward 300 ticks
-        Serial.println("State: INIT FWD 10cm");      // Log transition
-        enterState(STATE_INIT_FWD_10);               // Switch state
+      if (driveRelativeDistance(-300, BASE_SPEED)) {
+        Serial.println("State: INIT FWD 10cm");
+        enterState(STATE_INIT_FWD_10);
       }
       break;
 
     case STATE_INIT_FWD_10:
-      if (driveRelativeDistance(210, BASE_SPEED)) { // Move forward 210 ticks
-        set_speed(STOP, STOP);                      // Halt motors
-        delay(500);                                 // Stability dwell
-        Serial.println("RESETTING ENCODERS FOR TRACKING"); // Log reset
-        resetHardwareEncoders();                    // Re-zero encoders for search phase
-        delay(100);                                 // Wait for reset
-        headingTarget = TICKS_FOR_50;               // Define scan offset
-        Serial.println("State: PRE-SWEEP TURN 50"); // Log transition
-        currentState = STATE_PRE_SWEEP_TURN_50;     // Switch state
+      if (driveRelativeDistance(210, BASE_SPEED)) {
+        set_speed(STOP, STOP);
+        delay(500);
+        Serial.println("RESETTING ENCODERS");
+        resetHardwareEncoders();
+        delay(100);
+        headingTarget = TICKS_FOR_50;
+        Serial.println("State: PRE-SWEEP TURN 50");
+        currentState = STATE_PRE_SWEEP_TURN_50;
       }
       break;
 
     case STATE_PRE_SWEEP_TURN_50:
-      if (performTurnToTarget(headingTarget)) { // Pivot to search starting point
-         delay(500);                            // Dwell after pivot
-         Serial.println("State: SWEEPING FOR GREEN"); // Log transition
-         currentState = STATE_SWEEP;            // Begin scanning
+      if (performTurnToTarget(headingTarget)) {
+         delay(500);
+         Serial.println("State: SWEEPING FOR GREEN");
+         currentState = STATE_SWEEP;
       }
       break;
 
     case STATE_SWEEP:
-      set_speed(STOP - TURN_SPEED, STOP + TURN_SPEED); // Rotate robot slowly
-      if (checkForObject()) {         // Check if sensors detect an obstacle
-        set_speed(STOP, STOP);        // Immediately stop rotation
-        delay(500);                   // Dwell to stabilize readings
-        Serial.println("State: ALIGNING GREEN"); // Log transition
-        currentState = STATE_ALIGN_GREEN;        // Switch state
+      set_speed(STOP - TURN_SPEED, STOP + TURN_SPEED);
+      if (checkForObject()) {
+        set_speed(STOP, STOP);
+        delay(500);
+        Serial.println("State: ALIGNING GREEN");
+        currentState = STATE_ALIGN_GREEN;
       }
       break;
 
     case STATE_ALIGN_GREEN:
-      if (performAlignment(STATE_SWEEP)) { // Center on the detected object
-        Serial.println("State: APPROACHING GREEN"); // Log transition
-        currentState = STATE_APPROACH;              // Begin approach
+      if (performAlignment(STATE_SWEEP)) {
+        Serial.println("State: APPROACHING GREEN");
+        currentState = STATE_APPROACH;
       }
       break;
 
     case STATE_APPROACH:
-      if (performDifferentialApproach()) { // Drive toward object using steering
-        Serial.println("State: INDICATING GREEN"); // Log transition
-        currentState = STATE_INDICATE;             // Move to success indicator
+      if (performDifferentialApproach()) {
+        Serial.println("State: INDICATING GREEN");
+        currentState = STATE_INDICATE;
       }
       break;
 
     case STATE_INDICATE:
-      set_speed(STOP, STOP);      // Ensure robot is stationary
-      digitalWrite(ledPin, HIGH); // Activate status LED
-      delay(2000);                // Maintain LED status for 2 seconds
-      digitalWrite(ledPin, LOW);  // Deactivate status LED
-      Serial.println("State: REVERSING"); // Log transition
-      enterState(STATE_REVERSE_FROM_CAN); // Switch state
+      set_speed(STOP, STOP);
+      digitalWrite(ledPin, HIGH);
+      delay(2000);
+      digitalWrite(ledPin, LOW);
+      Serial.println("State: REVERSING");
+      enterState(STATE_REVERSE_FROM_CAN);
       break;
 
     case STATE_REVERSE_FROM_CAN:
-      if (driveRelativeDistance(-50, BASE_SPEED)) { // Back away 50 ticks
-          currentState = STATE_STRAIGHTEN;          // Switch state
+      if (driveRelativeDistance(-50, BASE_SPEED)) {
+          currentState = STATE_STRAIGHTEN;
       }
       break;
 
     case STATE_STRAIGHTEN:
-      if (returnToZeroHeading()) { // Align back to the initial start heading
-          delay(500);              // Post-alignment dwell
-          Serial.println("State: TURN 90 ACW (1)"); // Log transition
-          headingTarget = -TICKS_FOR_90;            // Set 90-deg left target
-          currentState = STATE_OFFSET_TURN_1;       // Switch state
+      if (returnToZeroHeading()) {
+          delay(500);
+          Serial.println("State: TURN 90 ACW (1)");
+          headingTarget = -TICKS_FOR_90;
+          currentState = STATE_OFFSET_TURN_1;
       }
       break;
 
     case STATE_OFFSET_TURN_1:
-      if (performTurnToTarget(headingTarget)) { // Execute bypass turn
-          delay(500);                           // Turn dwell
-          Serial.println("State: OFFSET FWD 15cm"); // Log transition
-          enterState(STATE_OFFSET_FWD);             // Move to bypass leg
+      if (performTurnToTarget(headingTarget)) {
+          delay(500);
+          Serial.println("State: OFFSET FWD 15cm");
+          enterState(STATE_OFFSET_FWD);
       }
       break;
 
     case STATE_OFFSET_FWD:
-      if (driveRelativeDistance(150, BASE_SPEED)) { // Advance 150 ticks
-          delay(500);                               // Move dwell
-          Serial.println("State: TURN 90 ACW (2)"); // Log transition
-          long currentHeading = getEncoder1() - getEncoder2(); // Refresh heading
-          headingTarget = currentHeading - TICKS_FOR_90;       // Set second left turn
-          currentState = STATE_OFFSET_TURN_2;                  // Switch state
+      if (driveRelativeDistance(150, BASE_SPEED)) {
+          delay(500);
+          Serial.println("State: TURN 90 ACW (2)");
+          long currentHeading = getEncoder1() - getEncoder2();
+          headingTarget = currentHeading - TICKS_FOR_90;
+          currentState = STATE_OFFSET_TURN_2;
       }
       break;
 
     case STATE_OFFSET_TURN_2:
-      if (performTurnToTarget(headingTarget)) { // Execute final bypass turn
-          delay(500);                           // Turn dwell
-          Serial.println("State: RETURN TO WALL"); // Log transition
-          currentState = STATE_RETURN_TO_WALL;     // Switch state
+      if (performTurnToTarget(headingTarget)) {
+          delay(500);
+          Serial.println("State: RETURN TO WALL");
+          currentState = STATE_RETURN_TO_WALL;
       }
       break;
 
     case STATE_RETURN_TO_WALL:
-      set_speed(STOP + BASE_SPEED, STOP + BASE_SPEED); // Drive forward toward wall
-      if (checkForWall(WALL_TARGET_DIST)) { // Stop when wall is detected
-          set_speed(STOP, STOP);            // Halt motors
-          delay(500);                       // Stability dwell
-          long currentHeading = getEncoder1() - getEncoder2(); // Calculate heading
-          headingTarget = currentHeading + TICKS_FOR_90;       // Set 90-deg right turn
-          currentState = STATE_TURN_90_CLOCKWISE;              // Switch state
+      set_speed(STOP + BASE_SPEED, STOP + BASE_SPEED);
+      if (checkForWall(WALL_TARGET_DIST)) {
+          set_speed(STOP, STOP);
+          delay(500);
+          long currentHeading = getEncoder1() - getEncoder2();
+          headingTarget = currentHeading + TICKS_FOR_90;
+          currentState = STATE_TURN_90_CLOCKWISE;
       }
       break;
 
     case STATE_TURN_90_CLOCKWISE:
-      if (performTurnToTarget(headingTarget)) { // Align for Red can search
-          delay(500);                           // Turn dwell
-          Serial.println("State: SEARCHING RED"); // Log transition
-          enterState(STATE_RED_SEARCH);           // Switch state
+      if (performTurnToTarget(headingTarget)) {
+          delay(500);
+          Serial.println("State: SEARCHING RED");
+          enterState(STATE_RED_SEARCH);
       }
       break;
 
     case STATE_RED_SEARCH:
-       set_speed(STOP + SEARCH_SPEED, STOP + SEARCH_SPEED); // Advance to find Red can
-       if (checkForObject()) { // Stop if an object breaks the path
-          set_speed(STOP, STOP); // Halt motors
-          delay(500);            // Dwell
-          currentState = STATE_ALIGN_RED; // Move to alignment
+       set_speed(STOP + SEARCH_SPEED, STOP + SEARCH_SPEED);
+       if (checkForObject()) {
+          set_speed(STOP, STOP);
+          delay(500);
+          currentState = STATE_ALIGN_RED;
        }
        break;
 
     case STATE_ALIGN_RED:
-       if (performAlignment(STATE_RED_SEARCH)) { // Center heading on Red can
-          Serial.println("State: APPROACHING RED"); // Log transition
-          currentState = STATE_RED_APPROACH;        // Switch state
+       if (performAlignment(STATE_RED_SEARCH)) {
+          Serial.println("State: APPROACHING RED");
+          currentState = STATE_RED_APPROACH;
        }
        break;
 
     case STATE_RED_APPROACH:
-      if (performDifferentialApproach()) { // Close in on Red can
-        currentState = STATE_RED_INDICATE; // Move to success indicator
+      if (performDifferentialApproach()) {
+        currentState = STATE_RED_INDICATE;
       }
       break;
 
     case STATE_RED_INDICATE:
-      set_speed(STOP, STOP);      // Stop motors
-      digitalWrite(ledPin, HIGH); // Signal detection with LED
-      delay(2000);                // Hold for 2 seconds
-      digitalWrite(ledPin, LOW);  // Turn off LED
-      Serial.println("State: REVERSING FROM RED"); // Log transition
-      enterState(STATE_RED_CLEAR_CAN);               // Switch state
+      set_speed(STOP, STOP);
+      digitalWrite(ledPin, HIGH);
+      delay(2000);
+      digitalWrite(ledPin, LOW);
+      Serial.println("State: REVERSING FROM RED");
+      enterState(STATE_RED_CLEAR_CAN);
       break;
 
     // --- END SEQUENCE ---
 
     case STATE_RED_CLEAR_CAN:
-      // Tweaked by user: -100
+      // TWEAKED: -100 ticks
       if (driveRelativeDistance(-100, BASE_SPEED)) { 
          Serial.println("State: TURNING RIGHT 90");
          long currentHeading = getEncoder1() - getEncoder2(); 
@@ -300,7 +298,7 @@ void loop() {
       break;
       
     case STATE_REVERSE_INTO_WALL:
-      // Drive backwards 500 ticks to hit wall (User's value)
+      // TWEAKED: -500 ticks
       if (driveRelativeDistance(-500, BASE_SPEED)) { 
           set_speed(STOP, STOP);
           delay(500);
@@ -315,7 +313,7 @@ void loop() {
       break;
 
     case STATE_FORWARD_FROM_WALL:
-      // Tweaked by user: 190
+      // TWEAKED: 190 ticks
       if (driveRelativeDistance(190, BASE_SPEED)) {
          set_speed(STOP, STOP);
          delay(500);
@@ -335,7 +333,7 @@ void loop() {
       break;
 
     case STATE_DRIVE_TO_FINISH:
-      // Drive forward 60cm (600 ticks)
+      // TWEAKED: 600 ticks
       if (driveRelativeDistance(600, BASE_SPEED)) {
           Serial.println("MISSION COMPLETE");
           currentState = STATE_COMPLETE;
@@ -343,54 +341,176 @@ void loop() {
       break;
 
     case STATE_COMPLETE:
-      set_speed(STOP, STOP); // Maintain stationary state indefinitely
+      set_speed(STOP, STOP);
       break;
   }
 }
 
 // ==========================================
-// 5. HELPER FUNCTIONS (The "Muscle")
+// 5. HELPER FUNCTIONS
 // ==========================================
 
 void enterState(RobotState newState) {
-  currentState = newState;           // Update the global state variable
-  moveStartEncoder = getAvgEncoder(); // Capture the encoder position at start
+  currentState = newState;
+  moveStartEncoder = getAvgEncoder();
 }
 
 long getAvgEncoder() {
-  return (getEncoder1() + getEncoder2()) / 2; // Return the mean of both encoder values
+  return (getEncoder1() + getEncoder2()) / 2;
 }
 
 bool driveRelativeDistance(long targetMM, int speed) {
-  long currentPos = getAvgEncoder();             // Get current displacement
-  long distTraveled = currentPos - moveStartEncoder; // Calculate delta since start
-  long targetTicks = targetMM * TICKS_PER_MM;    // Convert input mm to ticks
+  long currentPos = getAvgEncoder();
+  long distTraveled = currentPos - moveStartEncoder;
+  long targetTicks = targetMM * TICKS_PER_MM;
 
-  if (abs(distTraveled) < abs(targetTicks)) {    // Check if target is still ahead
-    if (targetMM > 0) set_speed(STOP + speed, STOP + speed); // Forward motion
-    else set_speed(STOP - speed, STOP - speed);              // Backward motion
-    return false; // Task incomplete
+  if (abs(distTraveled) < abs(targetTicks)) {
+    if (targetMM > 0) set_speed(STOP + speed, STOP + speed);
+    else set_speed(STOP - speed, STOP - speed);
+    return false;
   } else {
-    set_speed(STOP, STOP); // Target reached, stop motors
-    return true; // Task complete
+    set_speed(STOP, STOP);
+    return true;
   }
 }
 
 bool performAlignment(RobotState fallbackState) {
-  int dL = readSensor(trigLeft, echoLeft);   // Query left ultrasonic sensor
-  delay(5);                                  // Prevent ultrasonic cross-talk
-  int dR = readSensor(trigRight, echoRight); // Query right ultrasonic sensor
+  int dL = readSensor(trigLeft, echoLeft); delay(5);
+  int dR = readSensor(trigRight, echoRight);
 
-  if ((dL > SCAN_DIST || dL == 999) && (dR > SCAN_DIST || dR == 999)) { // Check for loss of target
-    currentState = fallbackState; // Revert to previous searching state
-    return false;                 // Alignment failed
+  if ((dL > SCAN_DIST || dL == 999) && (dR > SCAN_DIST || dR == 999)) {
+    currentState = fallbackState;
+    return false;
   }
 
-  int error = dL - dR; // Calculate distance differential between sensors
-  if (abs(error) <= ALIGN_TOLERANCE) { // Check if heading is centered enough
-    set_speed(STOP, STOP); // Halt rotation
-    delay(200);            // Brief stabilization dwell
-    return true;           // Alignment successful
+  int error = dL - dR;
+  if (abs(error) <= ALIGN_TOLERANCE) {
+    set_speed(STOP, STOP);
+    delay(200);
+    return true;
   }
 
-  int rot
+  int rotSpeed = 10;
+  if (error > 0) set_speed(STOP + rotSpeed, STOP - rotSpeed);
+  else set_speed(STOP - rotSpeed, STOP + rotSpeed);
+  
+  return false;
+}
+
+bool performDifferentialApproach() {
+  int dL = readSensor(trigLeft, echoLeft); delay(10);
+  int dR = readSensor(trigRight, echoRight);
+  if (dL == 0) dL = 999;
+  if (dR == 0) dR = 999;
+
+  int closest = min(dL, dR);
+  if (closest > 0 && closest <= GRAB_DIST) {
+    set_speed(STOP, STOP);
+    return true;
+  }
+
+  int error = dL - dR;
+  int turnFactor = error * 1.5;
+  turnFactor = constrain(turnFactor, -30, 30);
+  set_speed(STOP + (BASE_SPEED + turnFactor), STOP + (BASE_SPEED - turnFactor));
+  return false;
+}
+
+bool returnToZeroHeading() {
+  long heading = getEncoder1() - getEncoder2();
+  if (abs(heading) < 10) {
+    set_speed(STOP, STOP);
+    return true;
+  }
+  int turnPower = abs(heading) / 4;
+  turnPower = constrain(turnPower, 15, 25);
+  if (heading < 0) set_speed(STOP + turnPower, STOP - turnPower);
+  else set_speed(STOP - turnPower, STOP + turnPower);
+  return false;
+}
+
+bool performTurnToTarget(long target) {
+  long currentHeading = getEncoder1() - getEncoder2();
+  long error = currentHeading - target;
+
+  if (abs(error) < 15) {
+    set_speed(STOP, STOP);
+    return true;
+  }
+  int turnPower = abs(error) / 4;
+  turnPower = constrain(turnPower, 15, 25);
+
+  if (error > 0) set_speed(STOP - turnPower, STOP + turnPower);
+  else set_speed(STOP + turnPower, STOP - turnPower);
+  
+  return false;
+}
+
+bool checkForWall(int limitCM) {
+  int dL = readSensor(trigLeft, echoLeft); delay(5);
+  int dR = readSensor(trigRight, echoRight);
+  if (dL == 0) dL = 999;
+  if (dR == 0) dR = 999;
+  if (dL <= limitCM || dR <= limitCM) return true;
+  return false;
+}
+
+// ==========================================
+// 6. HARDWARE HELPERS
+// ==========================================
+
+void resetHardwareEncoders() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(RESETENCODERS); Wire.write(0x20);
+  Wire.endTransmission();
+}
+
+bool checkForObject() {
+  int dL = readSensor(trigLeft, echoLeft); delay(10);
+  int dR = readSensor(trigRight, echoRight);
+  if ((dL > 1 && dL < SCAN_DIST) || (dR > 1 && dR < SCAN_DIST)) return true;
+  return false;
+}
+
+int readSensor(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long d = pulseIn(echo, HIGH, 25000);
+  return (d == 0) ? 999 : d * 0.034 / 2;
+}
+
+void set_speed(int s1, int s2) {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED1); Wire.write(constrain(s1, 0, 255));
+  Wire.endTransmission();
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED2); Wire.write(constrain(s2, 0, 255));
+  Wire.endTransmission();
+}
+
+long getEncoder1() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(ENCODERONE);
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0;
+  long pos = (long)Wire.read() << 24;
+  pos += (long)Wire.read() << 16;
+  pos += (long)Wire.read() << 8;
+  pos += (long)Wire.read();
+  return pos;
+}
+
+long getEncoder2() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(ENCODERTWO);
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0;
+  long pos = (long)Wire.read() << 24;
+  pos += (long)Wire.read() << 16;
+  pos += (long)Wire.read() << 8;
+  pos += (long)Wire.read();
+  return pos;
+}
