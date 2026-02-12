@@ -64,7 +64,10 @@ enum RobotState {
   STATE_REVERSE_INTO_WALL,   // Back up 50cm into wall
   STATE_FORWARD_FROM_WALL,   // Forward 19cm
   STATE_FINAL_LEFT_TURN,     // Turn Left 90
-  STATE_DRIVE_TO_FINISH,     // Drive 60cm to finish
+  
+  STATE_LONG_DRIVE_140,      // Drive 140cm
+  STATE_TURN_RIGHT_ALIGN,    // Turn Right 90
+  STATE_REVERSE_ALIGN_FINAL, // Back up 50cm into wall
   
   STATE_COMPLETE
 };
@@ -280,7 +283,7 @@ void loop() {
     // --- END SEQUENCE ---
 
     case STATE_RED_CLEAR_CAN:
-      // TWEAKED: -100 ticks
+      // TWEAK: -100 ticks
       if (driveRelativeDistance(-100, BASE_SPEED)) { 
          Serial.println("State: TURNING RIGHT 90");
          long currentHeading = getEncoder1() - getEncoder2(); 
@@ -298,7 +301,7 @@ void loop() {
       break;
       
     case STATE_REVERSE_INTO_WALL:
-      // TWEAKED: -500 ticks
+      // TWEAK: -500 ticks
       if (driveRelativeDistance(-500, BASE_SPEED)) { 
           set_speed(STOP, STOP);
           delay(500);
@@ -313,7 +316,7 @@ void loop() {
       break;
 
     case STATE_FORWARD_FROM_WALL:
-      // TWEAKED: 190 ticks
+      // TWEAK: 190 ticks
       if (driveRelativeDistance(190, BASE_SPEED)) {
          set_speed(STOP, STOP);
          delay(500);
@@ -327,14 +330,33 @@ void loop() {
     case STATE_FINAL_LEFT_TURN:
       if (performTurnToTarget(headingTarget)) {
          delay(500);
-         Serial.println("State: DRIVE 60CM TO FINISH");
-         enterState(STATE_DRIVE_TO_FINISH);
+         Serial.println("State: LONG DRIVE 140CM");
+         enterState(STATE_LONG_DRIVE_140);
       }
       break;
 
-    case STATE_DRIVE_TO_FINISH:
-      // TWEAKED: 600 ticks
-      if (driveRelativeDistance(600, BASE_SPEED)) {
+    case STATE_LONG_DRIVE_140:
+      // TWEAK: 1400 ticks (140cm)
+      if (driveRelativeDistance(1400, BASE_SPEED)) {
+          Serial.println("State: TURN RIGHT ALIGN");
+          delay(500);
+          long currentHeading = getEncoder1() - getEncoder2();
+          headingTarget = currentHeading + TICKS_FOR_90; 
+          currentState = STATE_TURN_RIGHT_ALIGN;
+      }
+      break;
+
+    case STATE_TURN_RIGHT_ALIGN:
+      if (performTurnToTarget(headingTarget)) {
+         delay(500);
+         Serial.println("State: REVERSE 50CM INTO WALL");
+         enterState(STATE_REVERSE_ALIGN_FINAL);
+      }
+      break;
+
+    case STATE_REVERSE_ALIGN_FINAL:
+      // Back up 50cm (500 ticks) to hit wall
+      if (driveRelativeDistance(-500, BASE_SPEED)) {
           Serial.println("MISSION COMPLETE");
           currentState = STATE_COMPLETE;
       }
