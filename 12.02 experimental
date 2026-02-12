@@ -1,15 +1,3 @@
-Here is the updated code.
-
-I have updated the End Sequence with your new requirements:
-
-Reverse 40cm into Wall: The robot reverses 400 ticks. If it hits the wall, the wheels should slip slightly to physically align (square up) the robot.
-
-Reset Encoders: Since we physically aligned against the wall, I added a command to reset the encoders to 0. This tells the robot "You are now perfectly straight."
-
-Turn Left 90: Using this new perfect alignment, it executes a precise 90-degree Left turn.
-
-Complete Code
-C++
 #include <Wire.h> // Include I2C library for communication with the MD25 controller
 
 // ==========================================
@@ -74,6 +62,7 @@ enum RobotState {
   STATE_RED_CLEAR_CAN,       // Slight reverse to avoid hitting the can
   STATE_TURN_RIGHT_90,       // Turn Right 90 degrees
   STATE_REVERSE_INTO_WALL,   // Drive backwards 40cm (Align)
+  STATE_FORWARD_FROM_WALL,   // NEW: Drive forward 10cm
   STATE_FINAL_LEFT_TURN,     // Turn Left 90 degrees
   
   STATE_COMPLETE              // Mission termination state
@@ -315,14 +304,27 @@ void loop() {
           set_speed(STOP, STOP);
           delay(500);
           
-          Serial.println("State: WALL HIT - RESETTING & TURNING LEFT");
+          Serial.println("State: WALL HIT - RESETTING ENCODERS");
           // Reset encoders because we are now "squared up" to the wall
           resetHardwareEncoders();
           delay(100);
           
-          // Turn Left (-90)
-          headingTarget = -TICKS_FOR_90;
-          currentState = STATE_FINAL_LEFT_TURN;
+          Serial.println("State: FORWARD 10CM");
+          enterState(STATE_FORWARD_FROM_WALL); // Go to new forward state
+      }
+      break;
+
+    case STATE_FORWARD_FROM_WALL:
+      // NEW: Drive forward 10cm (100 ticks)
+      if (driveRelativeDistance(100, BASE_SPEED)) {
+         set_speed(STOP, STOP);
+         delay(500);
+         
+         Serial.println("State: TURNING LEFT 90");
+         // Since encoders were reset at the wall, and we drove straight,
+         // current heading is ~0. Target is -90 for LEFT turn.
+         headingTarget = -TICKS_FOR_90;
+         currentState = STATE_FINAL_LEFT_TURN;
       }
       break;
 
