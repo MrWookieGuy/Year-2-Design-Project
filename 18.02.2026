@@ -463,7 +463,7 @@ void loop() {
     // POST-YELLOW: reverse to wall, align to wall, forward 15cm, turn left 90
     // ==========================================================
     case STATE_POST_YELLOW_BACK_40:
-      if (driveRelativeDistance(-650, BASE_SPEED)) {    // Reverse ~50cm (650 ticks)
+      if (driveRelativeDistance(-400, BASE_SPEED)) {    // Reverse ~40cm (400 ticks)
         set_speed(STOP, STOP);                          // Stop after reversing
         delay(300);                                     // Pause
         Serial.println("YELLOW: ALIGN TO WALL");        // Debug print
