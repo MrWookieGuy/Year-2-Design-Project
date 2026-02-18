@@ -1,20 +1,5 @@
 /****************************************************************************************
   FULL ANNOTATED (COPY/PASTE) CODE FILE — UPDATED REQUEST
-
-  ✅ Change you asked for (YELLOW can behavior):
-  - After YELLOW can is detected + LED indicates:
-      1) Reverse a little (same as first can: -50)
-      2) Straighten heading (same returnToZeroHeading() method as first can)
-      3) THEN reverse ~40cm toward the wall
-      4) Align square to the wall (ultrasonic-based)
-      5) Drive forward ~15cm
-      6) Turn left (anti-clockwise) 90°
-      7) Stop (STATE_COMPLETE)
-
-  ✅ You also asked: "comment on each line explaining what it does"
-  - I have commented every meaningful line.
-  - I did NOT comment every brace-only line `{` and `}` because that becomes unreadable,
-    but every statement line is explained.
 ****************************************************************************************/
 
 #include <Wire.h>                                   // Include I2C library for communicating with MD25 motor controller
@@ -445,7 +430,7 @@ void loop() {
       break;
 
     case STATE_YELLOW_REVERSE_SMALL:
-      if (driveRelativeDistance(-50, BASE_SPEED)) {     // Reverse small distance (~5cm)
+      if (driveRelativeDistance(-210, BASE_SPEED)) {     // Reverse small distance (~5cm)
         Serial.println("YELLOW: STRAIGHTENING");        // Debug print
         currentState = STATE_YELLOW_STRAIGHTEN;         // Then straighten heading
       }
