@@ -1,0 +1,48 @@
+#include <Servo.h>
+
+#define SERVO_PIN     10
+
+#define GRIPPER_OPEN   170
+#define GRIPPER_CLOSE  130
+
+#define CLOSE_SPEED    40
+
+Servo gripper;
+
+void setup() {
+  Serial.begin(9600);
+  gripper.attach(SERVO_PIN);
+
+  // Wait 5 seconds - turn your switch on during this time!
+  Serial.println("You have 5 seconds to turn the switch on...");
+  delay(5000);
+
+  // Open gripper
+  Serial.println("Opening gripper...");
+  gripper.write(GRIPPER_OPEN);
+  delay(2000);
+
+  // Slowly close onto can
+  Serial.println("Closing gripper...");
+  slowMove(GRIPPER_OPEN, GRIPPER_CLOSE, CLOSE_SPEED);
+
+  Serial.println("Done!");
+}
+
+void loop() {
+  // Nothing - runs once
+}
+
+void slowMove(int fromPos, int toPos, int speedDelay) {
+  if (fromPos < toPos) {
+    for (int pos = fromPos; pos <= toPos; pos++) {
+      gripper.write(pos);
+      delay(speedDelay);
+    }
+  } else {
+    for (int pos = fromPos; pos >= toPos; pos--) {
+      gripper.write(pos);
+      delay(speedDelay);
+    }
+  }
+}
