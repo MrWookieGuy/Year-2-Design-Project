@@ -1,0 +1,244 @@
+/* * INTERPLANETARY ROBOT - AUTONOMOUS STATE MACHINE
+ * Team: [Insert Team Name]
+ * * Hardware:
+ * 1. MD25 Motor Driver (I2C Address 0x58)
+ * 2. Left Sensor: Trig 3, Echo 2
+ * 3. Right Sensor: Trig 9, Echo 8
+ * 4. Status LED: Pin 12
+ * * Logic: Modified for Wide-Sensor Configuration
+ */
+
+#include <Wire.h>
+
+// ==========================================
+// 1. PIN & ADDRESS DEFINITIONS
+// ==========================================
+#define MD25ADDRESS 0x58
+#define SPEED1 (byte)0x00
+#define SPEED2 0x01
+#define ENCODERONE 0x02
+#define ENCODERTWO 0x06
+#define RESETENCODERS 0x10
+#define MODESELECTOR 0xF
+
+// Sensors
+#define trigLeft 3
+#define echoLeft 2
+#define trigRight 9
+#define echoRight 8
+#define ledPin 12
+
+// ==========================================
+// 2. TUNING CONSTANTS
+// ==========================================
+const int STOP = 128;
+const int BASE_SPEED = 25;      // Slightly faster to overcome wide-turn friction
+const int TURN_SPEED = 18;      
+const int SCAN_DIST = 100;      // Detection range (cm)
+const int GRAB_DIST = 18;       // Distance to stop (increased slightly for safety)
+const int MAX_SENSE_DIST = 150; // Max reliable sensor range
+
+// Encoder ticks
+const float TICKS_PER_MM = 1.0; 
+
+// ==========================================
+// 3. STATE MACHINE DEFINITIONS
+// ==========================================
+enum RobotState {
+  STATE_STARTUP,
+  STATE_MOVE_TO_BOX,
+  STATE_SWEEP,
+  STATE_APPROACH,
+  STATE_INDICATE,
+  STATE_COMPLETE
+};
+
+RobotState currentState = STATE_STARTUP;
+
+// ==========================================
+// 4. SETUP
+// ==========================================
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  
+  pinMode(trigLeft, OUTPUT); pinMode(echoLeft, INPUT);
+  pinMode(trigRight, OUTPUT); pinMode(echoRight, INPUT);
+  pinMode(ledPin, OUTPUT);
+  
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(MODESELECTOR);
+  Wire.write(0); 
+  Wire.endTransmission();
+  
+  encoderReset();
+  Serial.println("SYSTEM READY.");
+}
+
+// ==========================================
+// 5. MAIN LOOP
+// ==========================================
+void loop() {
+  switch (currentState) {
+    
+    case STATE_STARTUP:
+      delay(2000); 
+      encoderReset(); 
+      delay(100);
+      Serial.println("State: MOVING TO BOX");
+      currentState = STATE_MOVE_TO_BOX;
+      break;
+
+    case STATE_MOVE_TO_BOX:
+      if (driveDistance(600, BASE_SPEED)) {
+        Serial.println("State: SWEEPING");
+        currentState = STATE_SWEEP;
+      }
+      break;
+
+    case STATE_SWEEP:
+      // Spin to find object
+      set_speed(STOP - TURN_SPEED, STOP + TURN_SPEED);
+      if (checkForObject()) {
+        set_speed(STOP, STOP); 
+        delay(500); 
+        Serial.println("State: APPROACHING");
+        currentState = STATE_APPROACH;
+      }
+      break;
+
+    case STATE_APPROACH:
+      if (performDifferentialApproach()) {
+        Serial.println("State: INDICATING");
+        currentState = STATE_INDICATE;
+      }
+      break;
+
+    case STATE_INDICATE:
+      set_speed(STOP, STOP);
+      digitalWrite(ledPin, HIGH);
+      delay(3000);
+      digitalWrite(ledPin, LOW);
+      currentState = STATE_COMPLETE;
+      break;
+
+    case STATE_COMPLETE:
+      set_speed(STOP, STOP);
+      break;
+  }
+}
+
+// ==========================================
+// 6. MOVEMENT & LOGIC FUNCTIONS
+// ==========================================
+
+bool driveDistance(long distanceMM, int speed) {
+  long target = distanceMM * TICKS_PER_MM;
+  if (abs(getEncoder()) < target) {
+    set_speed(STOP + speed, STOP + speed);
+    return false;
+  } else {
+    set_speed(STOP, STOP);
+    encoderReset();
+    return true;
+  }
+}
+
+bool checkForObject() {
+  int dL = readSensor(trigLeft, echoLeft);
+  delay(20); // Increased delay to prevent pulse interference
+  int dR = readSensor(trigRight, echoRight);
+  
+  if ((dL > 2 && dL < SCAN_DIST) || (dR > 2 && dR < SCAN_DIST)) {
+    return true;
+  }
+  return false;
+}
+
+// NEW IMPROVED DIFFERENTIAL APPROACH
+bool performDifferentialApproach() {
+  int dL = readSensor(trigLeft, echoLeft);
+  delay(20);
+  int dR = readSensor(trigRight, echoRight);
+
+  // 1. ARRIVAL CHECK
+  // If either sensor is within grab range, we stop.
+  if ((dL > 0 && dL <= GRAB_DIST) || (dR > 0 && dR <= GRAB_DIST)) {
+    return true; 
+  }
+
+  // 2. ERROR CALCULATION
+  int error = dL - dR;
+  int leftMotor = BASE_SPEED;
+  int rightMotor = BASE_SPEED;
+
+  // 3. WIDE SENSOR LOGIC
+  // If one sensor loses the object (reads max), turn hard toward the other sensor
+  if (dL > SCAN_DIST && dR < SCAN_DIST) {
+    // Object only on Right -> Turn Right
+    leftMotor = BASE_SPEED + 10;
+    rightMotor = BASE_SPEED - 15;
+  } 
+  else if (dR > SCAN_DIST && dL < SCAN_DIST) {
+    // Object only on Left -> Turn Left
+    leftMotor = BASE_SPEED - 15;
+    rightMotor = BASE_SPEED + 10;
+  }
+  // If both see it, use proportional steering
+  else if (dL < SCAN_DIST && dR < SCAN_DIST) {
+    int steeringAdjust = error * 1.2; // Adjusted Kp for wider stance
+    steeringAdjust = constrain(steeringAdjust, -20, 20);
+    
+    leftMotor = BASE_SPEED + steeringAdjust;
+    rightMotor = BASE_SPEED - steeringAdjust;
+  }
+  // If both lose it, drift forward slowly (blind spot protection)
+  else {
+    leftMotor = BASE_SPEED - 5;
+    rightMotor = BASE_SPEED - 5;
+  }
+
+  set_speed(STOP + leftMotor, STOP + rightMotor);
+  return false;
+}
+
+// ==========================================
+// 7. HARDWARE HELPERS
+// ==========================================
+
+int readSensor(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long duration = pulseIn(echo, HIGH, 30000); // 30ms timeout
+  if (duration == 0) return 999;
+  return duration * 0.034 / 2;
+}
+
+void set_speed(int s1, int s2) {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED1); Wire.write(constrain(s1, 0, 255));
+  Wire.endTransmission();
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED2); Wire.write(constrain(s2, 0, 255));
+  Wire.endTransmission();
+}
+
+void encoderReset() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(RESETENCODERS); Wire.write(0x20);
+  Wire.endTransmission();
+}
+
+long getEncoder() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(ENCODERONE);
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0;
+  long pos = (long)Wire.read() << 24;
+  pos += (long)Wire.read() << 16;
+  pos += (long)Wire.read() << 8;
+  pos += (long)Wire.read();
+  return pos;
+}
