@@ -1,0 +1,79 @@
+#include <Servo.h>
+
+// ==========================================
+// 1. PIN DEFINITIONS
+// ==========================================
+// Servo Pin
+#define SERVO_PIN 10
+
+// Stepper Pins
+const int dirPin = 4;            
+const int stepPin = 5;           
+const int enablePin = 6; 
+
+Servo gripperServo;
+int currentAngle = 180;
+
+// ==========================================
+// 2. SETUP (Runs once)
+// ==========================================
+void setup() {
+  Serial.begin(9600);
+  Serial.println("--- GRIPPER & STEPPER TEST ---");
+
+  // --- STEPPER INITIALIZATION ---
+  pinMode(stepPin, OUTPUT);
+  pinMode(dirPin, OUTPUT);
+  pinMode(enablePin, OUTPUT);
+  digitalWrite(enablePin, HIGH); // Disable stepper by default
+
+  // --- SERVO INITIALIZATION ---
+  Serial.println("Moving to wide-open (180 degrees)...");
+  gripperServo.write(currentAngle);
+  gripperServo.attach(SERVO_PIN);
+  delay(2000); 
+
+  // --- GRIPPER TEST ---
+  currentAngle = currentAngle - 39; // Calculates to 141 degrees
+  Serial.println("Closing gripper by 39 degrees (to 141 degrees)...");
+  gripperServo.write(currentAngle);
+
+  // Give the servo time to fully close before firing the stepper
+  delay(1000);
+
+  // --- STEPPER TEST ---
+  Serial.println("Moving stepper UP 8000 steps at 50% speed...");
+  moveStepperUp(8000);
+  Serial.println("Test Complete.");
+}
+
+// ==========================================
+// 3. MAIN LOOP
+// ==========================================
+void loop() {
+  // Keep the loop empty. 
+}
+
+// ==========================================
+// 4. STEPPER CONTROL FUNCTIONS
+// ==========================================
+void moveStepperUp(long steps) {
+  digitalWrite(enablePin, LOW);  // Enable the stepper driver
+  
+  // Set direction to LOW to lift the mechanism
+  digitalWrite(dirPin, LOW);    
+  delay(50);
+  
+  for (long i = 0; i < steps; i++) {
+    digitalWrite(stepPin, HIGH);
+    
+    // 900us delay drops the speed to 50%
+    delayMicroseconds(900);      
+    
+    digitalWrite(stepPin, LOW);
+    delayMicroseconds(900);
+  }
+  
+  delay(50);
+  digitalWrite(enablePin, HIGH); // Disable the stepper driver after moving
+}
