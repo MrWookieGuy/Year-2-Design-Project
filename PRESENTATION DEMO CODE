@@ -1,0 +1,548 @@
+#include <Wire.h>                                    // Bring in the I2C library to talk to the MD25 motor driver
+#include <MobaTools.h>                               // Bring in MobaTools for servo speed control.
+
+// =========================================================================================
+// 1. HARDWARE PINS & I2C ADDRESSES
+// =========================================================================================
+#define MD25_ADDRESS      0x58                       // Factory I2C address for the MD25 board
+#define REG_SPEED_1       0x00                       // Register to control the left motor speed
+#define REG_SPEED_2       0x01                       // Register to control the right motor speed
+#define REG_CMD           0x10                       // Register to send system commands to the MD25
+#define REG_MODE          0x0F                       // Register to configure how the MD25 interprets speed bytes
+#define CMD_RESET_ENCS    0x20                       // The specific hex byte that zeroes the physical encoder counters
+
+#define PIN_TRIG_LEFT     3                          // Left ultrasonic trigger pulse pin
+#define PIN_ECHO_LEFT     2                          // Left ultrasonic echo listener pin
+#define PIN_TRIG_RIGHT    9                          // Right ultrasonic trigger pulse pin
+#define PIN_ECHO_RIGHT    8                          // Right ultrasonic echo listener pin
+#define PIN_GRIPPER       10                         // PWM pin governing the physical claw servo
+#define PIN_PAUSE_BTN     12                         // Physical emergency stop button pin
+
+// --- STEPPER PINS ---
+#define PIN_STEPPER_EN    4                          // Stepper driver Enable pin (Active LOW)
+#define PIN_STEPPER_DIR   5                          // Stepper driver Direction pin
+#define PIN_STEPPER_STEP  6                          // Stepper driver Step pulse pin
+
+// =========================================================================================
+// 2. KINEMATICS & TUNING CONSTANTS
+// =========================================================================================
+const int   CMD_STOP          = 128;                 // Speed 128 = stopped.
+const int   SPD_DASH          = 30;                  // Fast transit speed for long, clear stretches of the area
+const int   SPD_SEARCH        = 20;                  // Cautious speed used when sensors need time to react
+const int   SPD_TURN          = 18;                  // Controlled rotational speed to prevent wheel slip during pivots
+const int   SPD_SCAN          = 5;                   // Very low speed for panning to not lose target
+const int   SPD_REVERSE       = 35;                  // High speed reverse for squaring up to walls
+
+const int   DIST_SCAN_MAX     = 180;                 // Max ultrasonic distance, shouldn't require more than 1.8 metres across the test area
+const int   DIST_HALT         = 25;                  // Distance (cm) to trigger the blind-grab sequence
+const int   DIST_WALL_STOP    = 20;                  // Distance (cm) to stop dead in front of a drop-zone wall
+
+const float TICKS_PER_MM      = 1.0;                 // Hardware calibration: encoder pulses per millimeter of travel
+const long  TICKS_90_DEG      = 220;                 // Hardware calibration: pulses required to pivot exactly 90 degrees
+const long  TICKS_2_DEG       = 5;                   // Small tick threshold for aligning the jaws perfectly with a can
+
+const float STEER_KP          = 0.5;                 // Proportional gain multiplier for the differential steering formula
+const int   STEER_MAX_ADJ     = 8;                   // Hard cap on steering compensation to prevent violent swerving
+
+const int   SRV_ANG_CLOSED    = 110;                 // Servo degree where the jaws clamp the can firmly but safely
+const int   SRV_ANG_OPEN      = 180;                 // Servo degree where jaws are fully retracted
+const int   SRV_SPEED_LIMIT   = 10;                  // Software speed cap to prevent the servo from snapping mechanically
+
+const long  STEPPER_LIFT_STEPS = 2000;               // Total steps required to hoist the can clear off the ground, gear ratio 3:2, 10 rotations = 15mm up/down
+
+// =========================================================================================
+// 3. GLOBAL OBJECTS & STATE MACHINE
+// =========================================================================================
+MoToServo gripper;                                   // Declare the servo object
+long globalHeadingOffset = 0;                        // Accumulator that tracks how far off-axis the robot has veered
+
+enum MissionPhase {                                  // Define the three overarching chapters of the mission
+  PHASE_RED_CAN,                                     // Chapter 1: Locating and dropping the Red Can
+  PHASE_YELLOW_CAN,                                  // Chapter 2: Locating and dropping the Yellow Can
+  PHASE_GREEN_CAN,                                   // Chapter 3: Locating and dropping the Green Can
+  PHASE_MISSION_OVER                                 // Chapter 4: Terminal shutdown state
+};                                                  
+MissionPhase currentPhase = PHASE_RED_CAN;           // Initialize the mission at chapter 1
+
+enum RobotState {                                    // Define the reusable states for the robot
+  STATE_SYSTEM_INITIALIZATION,                       // State: System calibration and zeroing variables
+  STATE_TRANSIT_TO_SEARCH_ZONE,                      // State: Moving from a drop zone to a new search zone
+  STATE_PREPARE_HARDWARE_FOR_SWEEP,                  // State: Configuring hardware before scanning
+  STATE_SWEEP_FOR_TARGET_CAN,                        // State: Panning to find the payload
+  STATE_PROPORTIONAL_APPROACH,                       // State: Proportional tracking drive
+  STATE_MICRO_ALIGN_GRIPPER,                         // State: Tiny 2-degree nudge for dead-center grabbing
+  STATE_OPEN_GRIPPER_JAWS,                           // State: Deploying the grabber
+  STATE_PUSH_THROUGH_DEADZONE,                       // State: Driving into the deadzone where ultrasonic sensor is blind
+  STATE_CLOSE_GRIPPER_JAWS,                          // State: Securing the payload
+  STATE_CORRECT_HEADING_DRIFT,                       // State: Spinning to undo movements (using stored encoder values)
+  STATE_NAVIGATE_TO_DROP_ZONE,                       // State: Navigating the path to the specific drop zone
+  STATE_RELEASE_PAYLOAD,                             // State: Depositing the can
+  STATE_BACK_AWAY_FROM_DROP,                         // State: Reversing away from drop area
+  STATE_MISSION_COMPLETED                            // State: Turn off motors
+};                                                   
+RobotState currentState = STATE_SYSTEM_INITIALIZATION; // Start the state machine at initialization
+
+int navStep = 0;                                     // A generic counter to track progress through multi-step maneuvers
+
+// =========================================================================================
+// 4. MAIN SETUP
+// =========================================================================================
+void setup() {                                       // Initialization routine executed once on boot
+  Serial.begin(9600);                                // Open the serial port for diagnostic output
+  Wire.begin();                                      // Join the I2C bus as the master controller
+
+  pinMode(PIN_TRIG_LEFT,  OUTPUT);                   // Configure left ping pin
+  pinMode(PIN_ECHO_LEFT,  INPUT);                    // Configure left listen pin
+  pinMode(PIN_TRIG_RIGHT, OUTPUT);                   // Configure right ping pin
+  pinMode(PIN_ECHO_RIGHT, INPUT);                    // Configure right listen pin
+  pinMode(PIN_PAUSE_BTN,  INPUT_PULLUP);             // Wire the emergency stop button with an internal pull-up
+  
+  pinMode(PIN_STEPPER_EN, OUTPUT);                   // Configure the stepper driver enable pin
+  pinMode(PIN_STEPPER_DIR, OUTPUT);                  // Configure the stepper direction pin
+  pinMode(PIN_STEPPER_STEP, OUTPUT);                 // Configure the stepper step pin
+  digitalWrite(PIN_STEPPER_EN, HIGH);                // Disable the stepper motor on boot to prevent overheating
+
+  gripper.attach(PIN_GRIPPER);                       // Bind the servo object to the physical pin
+  gripper.setSpeed(SRV_SPEED_LIMIT);                 // Throttle the servo speed to protect the gears
+  
+  checkEmergencyPause();                             // Verify the operator isn't holding the kill switch
+  delay(2000);                                       // Give the operator 2 seconds to step back from the board
+  moveServoSmoothly(SRV_ANG_OPEN);                   // Ensure the jaws start open
+  delay(500);                                        // Wait for travel
+  moveServoSmoothly(SRV_ANG_CLOSED);                 // Test-close the jaws to verify power
+
+  Wire.beginTransmission(MD25_ADDRESS);              // Open channel to the motor board
+  Wire.write(REG_MODE);                              // Select the configuration register
+  Wire.write(0);                                     // Write '0' to enable raw, independent motor bytes
+  Wire.endTransmission();                            // Close the channel
+
+  wipeEncodersAndHeading();                          // Erase any garbage data from the trackers before we move
+  Serial.println("SYSTEM READY: INITIATING");        // Announce readiness
+}                                                    // End setup
+
+// =========================================================================================
+// 5. MAIN LOOP & STATE MACHINE
+// =========================================================================================
+void loop() {                                        // Continuous execution loop
+  checkEmergencyPause();                             // Always check for a manual override first
+
+  switch (currentState) {                            // Route execution based on our current task
+
+    case STATE_SYSTEM_INITIALIZATION:                // --- INITIALIZATION ---
+      wipeEncodersAndHeading();                      // Zero out trackers
+      delay(100);                                    // Let the I2C bus stabilize
+      currentState = STATE_TRANSIT_TO_SEARCH_ZONE;   // Move to the transit phase
+      break;                                         
+
+    case STATE_TRANSIT_TO_SEARCH_ZONE:               // --- TRANSIT TO SEARCH ZONES ---
+      if (currentPhase == PHASE_RED_CAN) {           // If we are looking for the red can:
+        if (driveDistance(700, SPD_DASH))            // Dash 700mm forward
+          currentState = STATE_PREPARE_HARDWARE_FOR_SWEEP; // Once arrived, prep for the scan
+      }                                              // End red transit
+      else if (currentPhase == PHASE_YELLOW_CAN) {   // If we are looking for the yellow can:
+        if (driveDistance(150, SPD_SEARCH))          // Move cautiously 150mm into the zone
+          currentState = STATE_PREPARE_HARDWARE_FOR_SWEEP; // Once arrived, prep for the scan
+      }                                              // End yellow transit
+      else if (currentPhase == PHASE_GREEN_CAN) {    // If we are executing the long green cross-board transit:
+        if (navStep == 0 && driveDistance(-700, SPD_REVERSE)) navStep++;          // Step 0: Square up against the back wall
+        else if (navStep == 1 && driveDistance(100, SPD_SEARCH)) navStep++;       // Step 1: Pull forward for turning clearance
+        else if (navStep == 2 && turnInPlace(TICKS_90_DEG, SPD_TURN, true)) navStep++; // Step 2: Turn CW to face across the arena
+        else if (navStep == 3 && driveDistance(1400, SPD_SEARCH)) navStep++;      // Step 3: Execute the massive 1.4 meter transit
+        else if (navStep == 4 && turnInPlace(TICKS_90_DEG, SPD_TURN, false)) {    // Step 4: Turn CCW into the green zone
+          navStep = 0;                               // Reset our multi-step counter for the next time we need it
+          currentState = STATE_PREPARE_HARDWARE_FOR_SWEEP; // Transit complete, prep for scan
+        }                                            // End final step
+      }                                              // End green transit
+      break;                                         
+
+    case STATE_PREPARE_HARDWARE_FOR_SWEEP:           // --- PRE-SCAN CONFIGURATION ---
+      if (currentPhase == PHASE_YELLOW_CAN || currentPhase == PHASE_GREEN_CAN) { // The later zones have tighter clearances
+        moveServoSmoothly(SRV_ANG_CLOSED);           // Stow the jaws so they don't clip a wall while spinning
+        delay(300);                                  // Wait for them to close
+      }                                              // End stow logic
+      if (currentPhase == PHASE_GREEN_CAN) {         // Green phase requires absolute precision
+        wipeEncodersAndHeading();                    // Nuke the drift tracker so the final hunt is perfectly calibrated
+      }                                              // End green reset
+      currentState = STATE_SWEEP_FOR_TARGET_CAN;     // Hardware is ready, start spinning
+      break;                                         
+
+    case STATE_SWEEP_FOR_TARGET_CAN:                 // --- RADAR SCANNING ---
+      setMotors(CMD_STOP + SPD_SCAN, CMD_STOP - SPD_SCAN); // Command the wheels to pan the robot slowly
+      if (isObjectDetected()) {                      // If either sonar bounces off a target:
+        setMotors(CMD_STOP, CMD_STOP);               // Slam the brakes
+        delay(500);                                  // Let chassis rocking settle
+        currentState = STATE_PROPORTIONAL_APPROACH;  // Transition to proportional tracking
+      }                                              // End detection logic
+      else if (currentPhase == PHASE_YELLOW_CAN && abs(readLeftEncoder()) >= TICKS_90_DEG) { // Edge-case: Yellow can is missing
+        setMotors(CMD_STOP, CMD_STOP);               // Stop spinning to prevent infinite loops
+        resetEncodersLogDrift();                     // Clean up the encoders
+        currentState = STATE_NAVIGATE_TO_DROP_ZONE;  // Abandon the grab and skip straight to drop navigation
+      }                                              // End fallback logic
+      break;                                         
+
+    case STATE_PROPORTIONAL_APPROACH:                // --- PROPORTIONAL TRACKING ---
+      if (driveDifferentialApproach()) {             // Hand control over to the P-Controller. Returns true when close.
+        setMotors(CMD_STOP, CMD_STOP);               // Stop driving
+        resetEncodersLogDrift();                     // Save how far the P-Controller veered off course into our global tracker
+        currentState = STATE_MICRO_ALIGN_GRIPPER;    // Proceed to the final nudge
+      }                                              // End tracking logic
+      break;                                         
+
+    case STATE_MICRO_ALIGN_GRIPPER:                  // --- DEAD-CENTER ALIGNMENT ---
+      if (turnInPlace(TICKS_2_DEG, SPD_TURN, true)) {// Execute a tiny 2-degree clockwise spin to perfectly align the jaws
+        currentState = STATE_OPEN_GRIPPER_JAWS;      // Proceed to deployment
+      }                                              // End alignment logic
+      break;                                         // Yield
+
+    case STATE_OPEN_GRIPPER_JAWS:                    // --- DEPLOY GRABBER ---
+      delay(300);                                    // Ensure zero momentum
+      moveServoSmoothly(SRV_ANG_OPEN);               // Spread the jaws wide
+      delay(500);                                    // Allow physical travel time
+      currentState = STATE_PUSH_THROUGH_DEADZONE;    // Proceed to the deadzone push
+      break;                                         // Yield
+
+    case STATE_PUSH_THROUGH_DEADZONE:                // --- PUSH THROUGH DEADZONE ---
+      if (driveDistance(280, SPD_SEARCH))            // Drive forward blindly 280mm since the can is now too close for ultrasonics
+        currentState = STATE_CLOSE_GRIPPER_JAWS;     // Proceed to clamping
+      break;                                         // Yield
+
+    case STATE_CLOSE_GRIPPER_JAWS:                   // --- SECURE PAYLOAD ---
+      delay(300);                                    // Ensure zero momentum
+      moveServoSmoothly(SRV_ANG_CLOSED);             // Clamp down on the payload
+      delay(500);                                    // Allow physical clamping time
+      
+      moveStepper(STEPPER_LIFT_STEPS, true);         // Hoist the payload securely off the floor
+      
+      resetEncodersLogDrift();                       // Clean the physical encoders before complex math begins
+      
+      if (currentPhase == PHASE_RED_CAN) {           // The red mission requires a unique lift-off action
+        if (driveDistance(50, SPD_SEARCH)) {         // Push the secured can 50mm forward to ensure clearance
+          delay(100);                                // Let it settle
+          currentState = STATE_CORRECT_HEADING_DRIFT; // Proceed to fixing our heading
+        }                                            // End red lift
+      } else {                                       // For yellow and green...
+        currentState = STATE_CORRECT_HEADING_DRIFT;  // ...proceed directly to fixing the heading
+      }                                              // End phase check
+      break;                                         // Yield
+
+    case STATE_CORRECT_HEADING_DRIFT:                // --- NULLIFY APPROACH ERROR ---
+      if (currentPhase == PHASE_RED_CAN) {           // Red drop-off doesn't require extreme precision
+        currentState = STATE_NAVIGATE_TO_DROP_ZONE;  // Skip correction and go straight to navigation
+      } else {                                       // Yellow and Green require tight tolerances
+        bool turnCW = (globalHeadingOffset < 0);     // Decide which way to unwind the error based on its sign
+        long ticksNeeded = abs(globalHeadingOffset); // Get the raw magnitude of the error
+        
+        if (ticksNeeded < 10) {                      // If the error is trivially small:
+          resetEncodersLogDrift();                   // Ignore it and reset the tracker
+          currentState = STATE_NAVIGATE_TO_DROP_ZONE; // Proceed to navigation
+        }                                            // End trivial check
+        else if (turnInPlace(ticksNeeded, SPD_TURN, turnCW)) { // Execute the correction spin
+          currentState = STATE_NAVIGATE_TO_DROP_ZONE; // Once straight, proceed to navigation
+        }                                            // End spin execution
+      }                                              // End phase logic
+      break;                                         // Yield
+
+    case STATE_NAVIGATE_TO_DROP_ZONE:                // --- DROP-OFF NAVIGATION ---
+      if (currentPhase == PHASE_RED_CAN) {           // Navigating to the Red Drop:
+        if (navStep == 0 && turnInPlace(TICKS_90_DEG, SPD_TURN, true)) navStep++;            // Step 0: Turn 90 CW
+        else if (navStep == 1 && driveDistance(-600, SPD_REVERSE)) navStep++;                // Step 1: Reverse 600mm to wall
+        else if (navStep == 2 && driveDistance(100, SPD_SEARCH)) navStep++;                  // Step 2: Pull forward 100mm
+        else if (navStep == 3 && turnInPlace(TICKS_90_DEG + 8, SPD_TURN, false)) navStep++;  // Step 3: Turn CCW with an 8-tick oversteer
+        else if (navStep == 4 && driveToWall(DIST_WALL_STOP, SPD_DASH)) {                    // Step 4: Dash forward until the drop wall is found
+          navStep = 0;                               // Reset the counter
+          currentState = STATE_RELEASE_PAYLOAD;      // Hand over to the release sequence
+        }                                            // End step 4
+      }                                              // End red nav
+      
+      else if (currentPhase == PHASE_YELLOW_CAN) {   // Navigating to the Yellow Drop:
+        if (navStep == 0 && turnInPlace(TICKS_90_DEG * 2 + 15, SPD_TURN, true)) navStep++;   // Step 0: U-Turn 180 degrees
+        else if (navStep == 1 && driveToWall(DIST_WALL_STOP, SPD_SEARCH)) navStep++;         // Step 1: Drive to orientation wall
+        else if (navStep == 2 && turnInPlace(TICKS_90_DEG * 2 + 15, SPD_TURN, true)) navStep++; // Step 2: U-Turn 180 degrees again
+        else if (navStep == 3 && driveDistance(-700, SPD_REVERSE)) navStep++;                // Step 3: Slam into squaring wall
+        else if (navStep == 4 && driveDistance(100, SPD_SEARCH)) navStep++;                  // Step 4: Pull off wall
+        else if (navStep == 5 && turnInPlace(TICKS_90_DEG, SPD_TURN, false)) navStep++;      // Step 5: Final 90 CCW turn
+        else if (navStep == 6 && driveToWall(DIST_WALL_STOP, SPD_SEARCH)) navStep++;         // Step 6: Drive to drop wall
+        else if (navStep == 7 && driveDistance(100, SPD_SEARCH)) {                           // Step 7: Final 100mm shove into the zone
+          navStep = 0;                               // Reset the counter
+          currentState = STATE_RELEASE_PAYLOAD;      // Hand over to the release sequence
+        }                                            // End step 7
+      }                                              // End yellow nav
+      
+      else if (currentPhase == PHASE_GREEN_CAN) {    // Navigating to the Green Drop:
+        if (navStep == 0 && turnInPlace(TICKS_90_DEG, SPD_TURN, false)) navStep++;           // Step 0: Turn 90 CCW
+        else if (navStep == 1 && driveDistance(500, SPD_SEARCH)) navStep++;                  // Step 1: Transit 500mm
+        else if (navStep == 2 && turnInPlace(TICKS_90_DEG, SPD_TURN, false)) navStep++;      // Step 2: Turn 90 CCW again
+        else if (navStep == 3 && driveToWall(DIST_WALL_STOP, SPD_SEARCH)) navStep++;         // Step 3: Drive to orientation wall
+        else if (navStep == 4 && turnInPlace(TICKS_90_DEG * 2 + 15, SPD_TURN, true)) navStep++; // Step 4: U-Turn 180 degrees
+        else if (navStep == 5 && driveDistance(-700, SPD_REVERSE)) navStep++;                // Step 5: Slam into squaring wall
+        else if (navStep == 6 && driveDistance(120, SPD_SEARCH)) navStep++;                  // Step 6: Pull off wall
+        else if (navStep == 7 && turnInPlace(TICKS_90_DEG, SPD_TURN, false)) navStep++;      // Step 7: Turn 90 CCW to face drop
+        else if (navStep == 8 && driveToWall(DIST_WALL_STOP, SPD_SEARCH)) navStep++;         // Step 8: Drive to final drop wall
+        else if (navStep == 9 && driveDistance(200, SPD_SEARCH)) {                           // Step 9: Final 200mm shove into the zone
+          navStep = 0;                               // Reset the counter
+          currentState = STATE_RELEASE_PAYLOAD;      // Hand over to the release sequence
+        }                                            // End step 9
+      }                                              // End green nav
+      break;                                         // Yield
+
+    case STATE_RELEASE_PAYLOAD:                      // --- DEPOSIT PAYLOAD ---
+      delay(500);                                    // Wait for chassis to settle
+      moveStepper(STEPPER_LIFT_STEPS, false);        // Lower the payload carefully back to the floor
+      moveServoSmoothly(SRV_ANG_OPEN);               // Deploy jaws to drop the can
+      delay(500);                                    // Ensure mechanism is clear
+      resetEncodersLogDrift();                       // Reset trackers for the escape move
+      currentState = STATE_BACK_AWAY_FROM_DROP;      // Proceed to backing away
+      break;                                         // Yield
+
+    case STATE_BACK_AWAY_FROM_DROP:                  // --- CLEAR DROP ZONE & PREP NEXT ---
+      if (currentPhase == PHASE_RED_CAN) {           // If finishing Red:
+        if (navStep == 0 && driveDistance(-150, SPD_REVERSE)) navStep++;                     // Step 0: Back up 150mm
+        else if (navStep == 1 && turnInPlace(TICKS_90_DEG, SPD_TURN, true)) navStep++;       // Step 1: Turn CW to face center
+        else if (navStep == 2) {                     // Step 2: Hard wall-reset maneuver
+          setMotors(CMD_STOP - SPD_REVERSE, CMD_STOP - SPD_REVERSE); // Blindly command reverse power
+          delay(2500);                               // Block the thread for 2.5s to smash the wall and square up
+          setMotors(CMD_STOP, CMD_STOP);             // Kill power
+          wipeEncodersAndHeading();                  // Nuke all trackers
+          navStep = 0;                               // Reset counter
+          currentPhase = PHASE_YELLOW_CAN;           // *** UPGRADE MISSION TO YELLOW ***
+          currentState = STATE_TRANSIT_TO_SEARCH_ZONE; // Restart the loop at transit
+        }                                            // End step 2
+      }                                              // End red backaway
+      
+      else if (currentPhase == PHASE_YELLOW_CAN) {   // If finishing Yellow:
+        if (navStep == 0 && driveDistance(-150, SPD_REVERSE)) navStep++;                     // Step 0: Back up 150mm
+        else if (navStep == 1 && turnInPlace(TICKS_90_DEG, SPD_TURN, true)) {                // Step 1: Turn 90 CW
+          navStep = 0;                               // Reset counter
+          currentPhase = PHASE_GREEN_CAN;            // *** UPGRADE MISSION TO GREEN ***
+          currentState = STATE_TRANSIT_TO_SEARCH_ZONE; // Restart the loop at transit
+        }                                            // End step 1
+      }                                              // End yellow backaway
+      
+      else if (currentPhase == PHASE_GREEN_CAN) {    // If finishing Green:
+        if (driveDistance(-100, SPD_REVERSE)) {      // Back up 100mm to get clear
+          Serial.println("ALL PHASES COMPLETE!");    // Log success to terminal
+          currentState = STATE_MISSION_COMPLETED;    // Transition to terminal shutdown state
+        }                                            // End drive check
+      }                                              // End green backaway
+      break;                                         // Yield
+
+    case STATE_MISSION_COMPLETED:                    // --- MISSION ACCOMPLISHED ---
+      setMotors(CMD_STOP, CMD_STOP);                 // Permanently lock the motors
+      break;                                         // Execution traps here forever
+  }                                                  // End of giant state machine switch
+}                                                    // End of main loop
+
+// =========================================================================================
+// 6. MOTOR & HARDWARE HELPER FUNCTIONS
+// =========================================================================================
+
+void moveStepper(long steps, bool moveUp) {          // Helper to control the vertical lift payload mechanism
+  digitalWrite(PIN_STEPPER_EN, LOW);                 // Activate the stepper driver (Active LOW)
+  
+  if (moveUp) {                                      // Determine the direction of the lift
+    digitalWrite(PIN_STEPPER_DIR, HIGH);             // Assuming HIGH pulls the payload UP
+  } else {                                           // Otherwise...
+    digitalWrite(PIN_STEPPER_DIR, LOW);              // LOW drops the payload DOWN
+  }                                                  // End direction logic
+  
+  delay(50);                                         // Give the driver chip time to magnetize the coils
+  
+  for (long i = 0; i < steps; i++) {                 // Loop for the requested amount of travel
+    digitalWrite(PIN_STEPPER_STEP, HIGH);            // Pulse the step pin HIGH
+    delayMicroseconds(450);                          // Delay dictates the motor speed (lower = faster)
+    digitalWrite(PIN_STEPPER_STEP, LOW);             // Reset the pulse pin
+    delayMicroseconds(450);                          // Delay before the next pulse
+  }                                                  // End step loop
+  
+  delay(50);                                         // Wait for inertia to settle
+  digitalWrite(PIN_STEPPER_EN, HIGH);                // Disable the stepper driver to save battery and prevent heat
+}                                                    // End stepper function
+
+void moveServoSmoothly(int targetAngle) {            // Helper to prevent the servo from moving violently
+  gripper.write(targetAngle);                        // Instruct MobaTools to begin moving to the target
+  while (gripper.moving() > 0) {                     // Loop continuously while the arm is physically in transit
+    checkEmergencyPause();                           // Continually poll the kill-switch just in case
+    delay(10);                                       // Give the CPU a tiny rest to prevent locking up
+  }                                                  // End transit loop
+}                                                    // End servo function
+
+void checkEmergencyPause() {                         // Helper to intercept execution safely
+  if (digitalRead(PIN_PAUSE_BTN) == LOW) {           // If the hardware button is pressed down to ground:
+    setMotors(CMD_STOP, CMD_STOP);                   // Instantly cut power to wheels
+    Serial.println("--- SYSTEM PAUSED ---");         // Alert terminal
+    while (digitalRead(PIN_PAUSE_BTN) == LOW) {      // Trap the processor in this empty loop forever
+      delay(10);                                     // Yield CPU cycles while trapped
+    }                                                // Wait for button release
+    Serial.println("--- SYSTEM RESUMING ---");       // Alert terminal on release
+  }                                                  // End if check
+}                                                    // End pause function
+
+bool driveDistance(long distanceMM, int speed) {     // Helper to move straight using dead reckoning
+  long targetTicks = abs(distanceMM * TICKS_PER_MM); // Convert the requested millimeters into physical encoder pulses
+  if (abs(readLeftEncoder()) < targetTicks) {        // Check if the wheel has spun enough times yet
+    if (distanceMM > 0) {                            // A positive distance request means go forward
+      setMotors(CMD_STOP + speed, CMD_STOP + speed); // Push both motors forward at requested speed
+    } else {                                         // A negative distance request means go backward
+      setMotors(CMD_STOP - speed, CMD_STOP - speed); // Pull both motors backward at requested speed
+    }                                                // End direction logic
+    return false;                                    // Tell the state machine we are still busy driving
+  } else {                                           // If the goal ticks have finally been reached
+    setMotors(CMD_STOP, CMD_STOP);                   // Kill the motors
+    resetEncodersLogDrift();                         // Prime the trackers for the very next movement command
+    return true;                                     // Tell the state machine we finished the job
+  }                                                  // End completion logic
+}                                                    // End drive function
+
+bool turnInPlace(long ticks, int speed, bool turnCW) { // Helper to pivot the chassis precisely
+  if (abs(readLeftEncoder()) < ticks) {              // Check if the wheel has hit the rotational target
+    if (turnCW) {                                    // If we want to spin Clockwise
+      setMotors(CMD_STOP + speed, CMD_STOP - speed); // Left wheel forward, Right wheel backward
+    } else {                                         // If we want to spin Counter-Clockwise
+      setMotors(CMD_STOP - speed, CMD_STOP + speed); // Left wheel backward, Right wheel forward
+    }                                                // End direction logic
+    return false;                                    // Tell state machine the turn is still happening
+  } else {                                           // If the rotation is complete
+    setMotors(CMD_STOP, CMD_STOP);                   // Kill the motors
+    resetEncodersLogDrift();                         // Prime the trackers for next movement
+    return true;                                     // Tell state machine the turn is done
+  }                                                  // End completion logic
+}                                                    // End turn function
+
+bool driveToWall(int stopDistance, int speed) {      // Helper to drive blindly until sonar hits a wall
+  int leftPing = measureSonar(PIN_TRIG_LEFT, PIN_ECHO_LEFT);  // Grab distance from left sensor
+  delay(20);                                                  // Prevent ultrasonic wave interference
+  int rightPing = measureSonar(PIN_TRIG_RIGHT, PIN_ECHO_RIGHT); // Grab distance from right sensor
+  
+  if ((leftPing > 0 && leftPing <= stopDistance) ||  // If left sensor detects the wall inside the threshold
+      (rightPing > 0 && rightPing <= stopDistance)) { // Or the right sensor detects it
+    setMotors(CMD_STOP, CMD_STOP);                   // Stop the robot
+    resetEncodersLogDrift();                         // Reset trackers
+    return true;                                     // Report arrival
+  }                                                  // End hit logic
+  setMotors(CMD_STOP + speed, CMD_STOP + speed);     // If no wall, keep driving forward
+  return false;                                      // Report still driving
+}                                                    // End drive to wall function
+
+bool isObjectDetected() {                            // Helper to check if a can reflects a ping during sweeps
+  int leftPing = measureSonar(PIN_TRIG_LEFT, PIN_ECHO_LEFT);    // Test left side
+  delay(20);                                                    // Prevent overlap
+  int rightPing = measureSonar(PIN_TRIG_RIGHT, PIN_ECHO_RIGHT); // Test right side
+  return ((leftPing > 2 && leftPing < DIST_SCAN_MAX) ||         // True if left sees it (ignoring <2cm noise)
+          (rightPing > 2 && rightPing < DIST_SCAN_MAX));        // True if right sees it
+}                                                    // End detection function
+
+bool driveDifferentialApproach() {                   // Core AI loop for smoothly tracking the can
+  int leftPing = measureSonar(PIN_TRIG_LEFT, PIN_ECHO_LEFT);    // Get left distance
+  delay(20);                                                    // Pause
+  int rightPing = measureSonar(PIN_TRIG_RIGHT, PIN_ECHO_RIGHT); // Get right distance
+  
+  if ((leftPing > 0 && leftPing <= DIST_HALT) ||     // If the left sensor thinks we are touching the deadzone
+      (rightPing > 0 && rightPing <= DIST_HALT)) {   // Or the right sensor thinks we are touching it
+    return true;                                     // Report that we are close enough to start grabbing
+  }                                                  // End early exit
+
+  int trackingError = leftPing - rightPing;          // Calculate the discrepancy to see which way the can is drifting
+  int leftPwr = SPD_SEARCH, rightPwr = SPD_SEARCH;   // Setup baseline motor speeds before steering math
+
+  bool seesLeft = (leftPing <= DIST_SCAN_MAX);       // Boolean flag if left has a lock
+  bool seesRight = (rightPing <= DIST_SCAN_MAX);     // Boolean flag if right has a lock
+
+  if (seesLeft && seesRight) {                       // Ideal: Both sensors have a lock
+    int correction = constrain((int)(trackingError * STEER_KP), -STEER_MAX_ADJ, STEER_MAX_ADJ); // P-Controller formula
+    leftPwr += correction;                           // Adjust left wheel up or down
+    rightPwr -= correction;                          // Apply inverse adjustment to right wheel to steer
+  }                                                  // End both-lock
+  else if (!seesLeft && seesRight) {                 // Sub-optimal: Only right has a lock
+    leftPwr = SPD_SEARCH + 4;                        // Speed up outer wheel
+    rightPwr = SPD_SEARCH - 6;                       // Drag inner wheel to carve a hard right
+  }                                                  // End right-lock
+  else if (seesLeft && !seesRight) {                 // Sub-optimal: Only left has a lock
+    leftPwr = SPD_SEARCH - 6;                        // Drag inner wheel
+    rightPwr = SPD_SEARCH + 4;                       // Speed up outer wheel to carve a hard left
+  }                                                  // End left-lock
+  else {                                             // Worst-case: Can slipped into the blind spot
+    leftPwr = 5;                                     // Inch forward very slowly
+    rightPwr = 5;                                    // Inch forward very slowly
+  }                                                  // End blind spot
+  
+  setMotors(CMD_STOP + leftPwr, CMD_STOP + rightPwr); // Send the calculated trajectory to the hardware
+  return false;                                      // Report that tracking is still active
+}                                                    // End tracking function
+
+int measureSonar(int triggerPin, int echoPin) {      // Hardware abstraction for reading ultrasonic modules
+  digitalWrite(triggerPin, LOW);                     // Quiet the line
+  delayMicroseconds(2);                              // Wait a tick
+  digitalWrite(triggerPin, HIGH);                    // Fire the ultrasonic click
+  delayMicroseconds(10);                             // Hold the pulse for exactly 10 microseconds per datasheet
+  digitalWrite(triggerPin, LOW);                     // Cut the pulse
+  
+  long timeoutPulse = pulseIn(echoPin, HIGH, 30000); // Time how long it takes the echo to return (max 30ms wait)
+  if (timeoutPulse == 0) return 999;                 // If 30ms passes with no echo, return a massive error distance
+  return timeoutPulse * 0.034 / 2;                   // Multiply microsecond pulse by speed of sound (cm/us) and halve it for the round trip
+}                                                    // End sonar function
+
+void setMotors(int speedLeft, int speedRight) {      // Hardware abstraction for writing speed bytes over I2C
+  Wire.beginTransmission(MD25_ADDRESS);              // Open channel
+  Wire.write(REG_SPEED_1);                           // Target left motor
+  Wire.write(constrain(speedLeft, 0, 255));          // Send safe byte
+  Wire.endTransmission();                            // Close
+  
+  Wire.beginTransmission(MD25_ADDRESS);              // Open channel
+  Wire.write(REG_SPEED_2);                           // Target right motor
+  Wire.write(constrain(speedRight, 0, 255));         // Send safe byte
+  Wire.endTransmission();                            // Close
+}                                                    // End motor function
+
+// =========================================================================================
+// 7. I2C ENCODER MANAGEMENT
+// =========================================================================================
+
+long readLeftEncoder() {                             // Pulls the 32-bit integer from the left wheel hardware
+  Wire.beginTransmission(MD25_ADDRESS);              // Open channel
+  Wire.write(0x02);                                  // Point to highest byte of encoder 1
+  Wire.endTransmission();                            // Close to lock pointer
+  
+  Wire.requestFrom(MD25_ADDRESS, 4);                 // Ask chip to send 4 bytes back
+  if (Wire.available() < 4) return 0;                // Fail-safe to prevent corruption if bits are dropped
+  
+  long position = (long)Wire.read() << 24;           // Shift highest byte 24 spaces left
+  position |= (long)Wire.read() << 16;               // OR second byte into position
+  position |= (long)Wire.read() << 8;                // OR third byte into position
+  position |= (long)Wire.read();                     // OR lowest byte into position
+  return position;                                   // Return completed number
+}                                                    // End left encoder read
+
+long readRightEncoder() {                            // Pulls the 32-bit integer from the right wheel hardware
+  Wire.beginTransmission(MD25_ADDRESS);              // Open channel
+  Wire.write(0x06);                                  // Point to highest byte of encoder 2
+  Wire.endTransmission();                            // Close to lock pointer
+  
+  Wire.requestFrom(MD25_ADDRESS, 4);                 // Ask chip to send 4 bytes back
+  if (Wire.available() < 4) return 0;                // Fail-safe to prevent corruption
+  
+  long position = (long)Wire.read() << 24;           // Shift highest byte 24 spaces left
+  position |= (long)Wire.read() << 16;               // OR second byte into position
+  position |= (long)Wire.read() << 8;                // OR third byte into position
+  position |= (long)Wire.read();                     // OR lowest byte into position
+  return position;                                   // Return completed number
+}                                                    // End right encoder read
+
+void hardResetEncoders() {                           // Sends the hardware command to zero the chips
+  Wire.beginTransmission(MD25_ADDRESS);              // Open channel
+  Wire.write(REG_CMD);                               // Target command register
+  Wire.write(CMD_RESET_ENCS);                        // Send the specific clear hex code
+  Wire.endTransmission();                            // Close
+}                                                    // End hardware reset
+
+void resetEncodersLogDrift() {                       // Smart reset that preserves our error tracking
+  long leftPos = readLeftEncoder();                  // Read left wheel
+  long rightPos = readRightEncoder();                // Read right wheel
+  long drift = (leftPos - rightPos) / 2;             // Calculate how many more ticks one wheel spun than the other
+  globalHeadingOffset += drift;                      // Log this error to our global accumulator
+  hardResetEncoders();                               // Wipe the hardware clean for the next move
+}                                                    // End smart reset
+
+void wipeEncodersAndHeading() {                      // Nuclear reset for complete system clearing
+  hardResetEncoders();                               // Wipe physical hardware
+  globalHeadingOffset = 0;                           // Wipe our software error memory completely
+}                                                    // End nuclear reset
